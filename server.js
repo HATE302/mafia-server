@@ -223,7 +223,7 @@ function roomEmit(room, event, data) {
 }
 
 function alivePlayers(room) {
-    return room.players.filter(p => !room.dead.includes(p.uid) && !p.isBot || (!room.dead.includes(p.uid) && p.isBot));
+    return room.players.filter(p => !room.dead.includes(p.uid));
 }
 
 function aliveHumans(room) {
@@ -234,6 +234,11 @@ function checkWin(room) {
     const alive = alivePlayers(room);
     const aliveMafia = alive.filter(p => p.role === 'mafia');
     const aliveCiv   = alive.filter(p => p.role !== 'mafia');
+
+    console.log('[checkWin] alive=' + alive.length + ' mafia=' + aliveMafia.length + ' civ=' + aliveCiv.length);
+
+    // Защита: не объявлять победу до первого убийства
+    if (room.dead.length === 0) return null;
 
     if (aliveMafia.length === 0) return 'civ';
     if (aliveMafia.length >= aliveCiv.length) return 'mafia';
@@ -250,8 +255,17 @@ function eliminatePlayer(room, uid, reason) {
 }
 
 function startIntroductions(room) {
-    roomEmit(room, 'game_log', { msg: '🎭 Добро пожаловать в Мафию!', cls: 'system' });
-    const t = setTimeout(() => startDay(room), 3000);
+    roomEmit(room, 'game_log', { msg: '🎭 Добро пожаловать в Мафию! Город засыпает...', cls: 'system' });
+
+    // Сообщить мафии друг о друге перед первой ночью
+    const mafiaPlayers = room.players.filter(p => p.role === 'mafia' && !p.isBot);
+    const mafiaNames = room.players.filter(p => p.role === 'mafia').map(p => p.name).join(', ');
+    mafiaPlayers.forEach(p => {
+        const sock = sockets.get(p.uid);
+        if (sock) sock.emit('game_log', { msg: '🔴 Ваши союзники по мафии: ' + mafiaNames, cls: 'system' });
+    });
+
+    const t = setTimeout(() => startNight(room), 4000);
     room.timers.push(t);
 }
 
@@ -321,9 +335,10 @@ function resolveVote(room) {
 
 function startNight(room) {
     room.phase = 'night';
+    room.night = (room.night || 0) + 1;
     room.actions = {};
     roomEmit(room, 'night_start', {});
-    roomEmit(room, 'game_log', { msg: '🌙 Город засыпает... Мафия просыпается.', cls: 'system' });
+    roomEmit(room, 'game_log', { msg: '🌙 Ночь ' + room.night + '. Город засыпает... Мафия просыпается.', cls: 'system' });
 
     // Боты делают ночные действия
     const aliveList = alivePlayers(room);
