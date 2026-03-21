@@ -16,15 +16,48 @@ const express    = require('express');
 const http       = require('http');
 const { Server } = require('socket.io');
 const admin      = require('firebase-admin');
-const Anthropic  = require('@anthropic-ai/sdk');
+// ── Groq API для интеллекта ботов ────────────────────────
+// Модель: llama-3.1-8b-instant — ~14,400 запросов/день бесплатно
+// Регистрация: console.groq.com (без карты)
+// Добавить в Railway Variables: GROQ_API_KEY = gsk_...
+const GROQ_KEY = process.env.GROQ_API_KEY || null;
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL = 'llama-3.1-8b-instant';
 
-// ── Claude API для интеллекта ботов ───────────────────────
-const anthropic = process.env.ANTHROPIC_API_KEY
-    ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-    : null;
+if (GROQ_KEY) console.log('[Server] Groq AI для ботов: включён ✓ модель:', GROQ_MODEL);
+else console.warn('[Server] GROQ_API_KEY не задан — боты используют шаблонные фразы');
 
-if (anthropic) console.log('[Server] Claude AI для ботов: включён ✓');
-else console.warn('[Server] ANTHROPIC_API_KEY не задан — боты используют шаблонные фразы');
+async function callGroq(systemPrompt, userPrompt) {
+    if (!GROQ_KEY) return null;
+    try {
+        const res = await fetch(GROQ_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + GROQ_KEY
+            },
+            body: JSON.stringify({
+                model: GROQ_MODEL,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user',   content: userPrompt }
+                ],
+                max_tokens: 80,
+                temperature: 0.92
+            })
+        });
+        if (!res.ok) {
+            const err = await res.text();
+            console.error('[Groq] HTTP', res.status, err.slice(0, 150));
+            return null;
+        }
+        const data = await res.json();
+        return data?.choices?.[0]?.message?.content?.trim() || null;
+    } catch (e) {
+        console.error('[Groq] Ошибка:', e.message);
+        return null;
+    }
+}
 
 const app    = express();
 const server = http.createServer(app);
@@ -161,8 +194,7 @@ async function botSayAI(room, bot, situation, extra) {
     // Логируем чат для контекста
     if (!room.chatLog) room.chatLog = [];
 
-    if (!anthropic) {
-        // Fallback если нет API ключа
+    if (!GROQ_KEY) {
         if (situation === 'accuse' && extra && extra.name) fallbackSay(room, bot, 'accuse', extra);
         else if (situation === 'defend') fallbackSay(room, bot, 'defend');
         else fallbackSay(room, bot, 'discuss');
