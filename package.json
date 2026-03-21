@@ -1,7 +1,7 @@
 {
   "name": "mafia-city-server",
   "version": "1.0.0",
-  "description": "Mafia: City of Shadows — Game Server",
+  "description": "Mafia: City of Shadows \u2014 Game Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,7 +13,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "socket.io": "^4.7.2",
-    "firebase-admin": "^12.0.0"
+    "firebase-admin": "^12.0.0",
+    "@anthropic-ai/sdk": "^0.20.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

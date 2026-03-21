@@ -16,6 +16,15 @@ const express    = require('express');
 const http       = require('http');
 const { Server } = require('socket.io');
 const admin      = require('firebase-admin');
+const Anthropic  = require('@anthropic-ai/sdk');
+
+// ── Claude API для интеллекта ботов ───────────────────────
+const anthropic = process.env.ANTHROPIC_API_KEY
+    ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+    : null;
+
+if (anthropic) console.log('[Server] Claude AI для ботов: включён ✓');
+else console.warn('[Server] ANTHROPIC_API_KEY не задан — боты используют шаблонные фразы');
 
 const app    = express();
 const server = http.createServer(app);
@@ -50,12 +59,171 @@ try {
 }
 
 // ── Константы ──────────────────────────────────────────────
-const MAX_ROOM     = 7;
-const BOT_WAIT_MS  = 20000;  // 20 секунд ожидания перед добавлением ботов
-const GROUP_WAIT_MS = 5000;  // 5 секунд после прихода второго игрока
-const VOTE_TIME_MS = 40000;  // 40 секунд на голосование
-const NIGHT_TIME_MS = 30000; // 30 секунд на ночные действия
+const MAX_ROOM      = 7;
+const BOT_WAIT_MS   = 20000; // 20с ожидания перед добавлением ботов
+const GROUP_WAIT_MS = 5000;  // 5с после прихода второго игрока
+const VOTE_TIME_MS  = 45000; // 45с на голосование (боты ускоряют)
+const NIGHT_TIME_MS = 25000; // 25с на ночные действия (боты ускоряют)
+const DAY_DISCUSS_MS = 30000;// 30с обсуждения (боты пишут в чат)
 const BOT_NAMES = ['Виктор','Карло','Лоренцо','Анна','Марко','Лучия','Джузеппе','Роза','Энцо','Фиора'];
+
+// ── Резервные фразы (если Claude API недоступен) ─────────
+const FALLBACK_PHRASES = {
+    discuss:  ['Кто-то ведёт себя подозрительно...','Нужно быть осторожнее с голосованием.','Я наблюдаю за всеми.','Интересная ситуация...'],
+    accuse:   ['{name} ведёт себя очень подозрительно!','Я голосую против {name}.','Обратите внимание на {name}.'],
+    defend:   ['Я мирный, клянусь!','Не трогайте меня, я вам нужен.','Вы ошибаетесь насчёт меня.'],
+    morning:  ['Доброе утро...','Кто пережил ночь?','Нужно найти виновного сегодня.'],
+};
+
+function fallbackSay(room, bot, key, replacements) {
+    const list = FALLBACK_PHRASES[key] || FALLBACK_PHRASES.discuss;
+    let msg = list[Math.floor(Math.random() * list.length)];
+    if (replacements) Object.entries(replacements).forEach(([k,v]) => { msg = msg.replace('{'+k+'}', v); });
+    roomEmit(room, 'game_log', { msg: bot.name + ': ' + msg, cls: 'chat' });
+}
+
+// ── Построить контекст игры для Claude ────────────────────
+function buildGameContext(room, bot) {
+    const alive = alivePlayers(room);
+    const dead  = room.players.filter(p => room.dead.includes(p.uid));
+    const mem   = getBotMemory(room, bot.uid);
+
+    // История чата (последние 20 сообщений)
+    const chatHistory = (room.chatLog || []).slice(-20)
+        .map(e => `${e.name}: ${e.msg}`)
+        .join('\n');
+
+    // Кто как голосовал (история)
+    const voteHistory = (room.voteHistory || [])
+        .map(r => `День ${r.day}: ${r.votes.map(v => `${v.voter} → ${v.target}`).join(', ')} → выбыл: ${r.eliminated || 'никто'}`)
+        .join('\n');
+
+    // Что знает бот о других
+    const knowledge = alive
+        .filter(p => p.uid !== bot.uid)
+        .map(p => {
+            const score = mem.suspects[p.uid] || 0;
+            const confirmed = mem.confirmed[p.uid];
+            let info = p.name;
+            if (confirmed === true)  info += ' [ТОЧНО МАФИЯ]';
+            if (confirmed === false) info += ' [ТОЧНО НЕ МАФИЯ]';
+            else if (score > 3)      info += ' [очень подозрителен]';
+            else if (score > 1)      info += ' [немного подозрителен]';
+            else if (score < -1)     info += ' [скорее всего мирный]';
+            if (bot.role === 'mafia' && p.role === 'mafia') info += ' [твой союзник по мафии]';
+            return info;
+        })
+        .join(', ');
+
+    const roleDesc = {
+        mafia:     'Ты — МАФИЯ. Твоя цель: скрыть это и устранить мирных. Ври убедительно, переводи стрелки.',
+        civilian:  'Ты — МИРНЫЙ ЖИТЕЛЬ. Твоя цель: вычислить и устранить мафию через голосование.',
+        doctor:    'Ты — ДОКТОР. Ты знаешь что ты доктор, но скрываешь это. Ночью спасаешь игроков. Днём ведёшь себя как мирный.',
+        detective: 'Ты — ДЕТЕКТИВ. Ночью проверяешь игроков. Используй знания тактично — не раскрывай себя раньше времени.',
+    };
+
+    return {
+        systemPrompt: `Ты играешь в Мафию. Твоё имя: ${bot.name}.
+${roleDesc[bot.role] || roleDesc.civilian}
+
+ЖИВЫЕ ИГРОКИ: ${alive.map(p => p.name).join(', ')}
+ВЫБЫВШИЕ: ${dead.map(p => `${p.name}(${p.role})`).join(', ') || 'никто'}
+ТВОИ ЗНАНИЯ О ДРУГИХ: ${knowledge || 'пока ничего конкретного'}
+
+ИСТОРИЯ ГОЛОСОВАНИЙ:
+${voteHistory || 'Игра только началась'}
+
+ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ:
+${chatHistory || 'Тишина'}
+
+ПРАВИЛА ОТВЕТА:
+- Отвечай ТОЛЬКО одной-двумя фразами. Максимум 25 слов.
+- Говори по-русски, живо и естественно
+- НЕ начинай с "Я думаю" или "Мне кажется" каждый раз
+- Можешь задавать вопросы, обвинять, защищаться, сомневаться
+- Если ты мафия — никогда не признавайся, переводи стрелки
+- Реагируй на последние сообщения в чате если есть
+- Не используй смайлики`,
+    };
+}
+
+// ── Основная функция: бот говорит через Claude ────────────
+async function botSayAI(room, bot, situation, extra) {
+    // Логируем чат для контекста
+    if (!room.chatLog) room.chatLog = [];
+
+    if (!anthropic) {
+        // Fallback если нет API ключа
+        if (situation === 'accuse' && extra && extra.name) fallbackSay(room, bot, 'accuse', extra);
+        else if (situation === 'defend') fallbackSay(room, bot, 'defend');
+        else fallbackSay(room, bot, 'discuss');
+        return;
+    }
+
+    const ctx = buildGameContext(room, bot);
+    let userPrompt = '';
+
+    switch (situation) {
+        case 'discuss':
+            userPrompt = 'Сейчас фаза обсуждения. Выскажись — что думаешь о ситуации?';
+            break;
+        case 'accuse':
+            userPrompt = extra && extra.name
+                ? `Ты хочешь обвинить ${extra.name}. Скажи почему ты его подозреваешь.`
+                : 'Выскажи подозрение относительно кого-то из живых игроков.';
+            break;
+        case 'defend':
+            userPrompt = extra && extra.accuser
+                ? `${extra.accuser} только что обвинил тебя. Защитись!`
+                : 'Тебя подозревают. Как ты реагируешь?';
+            break;
+        case 'react_accusation':
+            userPrompt = extra && extra.accused && extra.accuser
+                ? `${extra.accuser} только что обвинил ${extra.accused}. Как ты реагируешь на это?`
+                : 'Кто-то только что обвинил другого игрока. Твоя реакция?';
+            break;
+        case 'morning':
+            userPrompt = extra && extra.victim
+                ? `Ночью погиб ${extra.victim}. Твоя первая реакция утром?`
+                : 'Наступило утро. Что скажешь?';
+            break;
+        case 'detective_reveal':
+            userPrompt = `Ты детектив и ЗНАЕШЬ что ${extra.name} — мафия. Реши: раскрыть себя публично или намекнуть косвенно?`;
+            break;
+        default:
+            userPrompt = 'Что скажешь сейчас?';
+    }
+
+    try {
+        const response = await anthropic.messages.create({
+            model: 'claude-haiku-4-5-20251001', // быстрая и дешёвая модель для ботов
+            max_tokens: 80,
+            system: ctx.systemPrompt,
+            messages: [{ role: 'user', content: userPrompt }]
+        });
+
+        let msg = response.content[0]?.text?.trim() || '...';
+        // Обрезаем если слишком длинно
+        if (msg.length > 120) msg = msg.substring(0, msg.lastIndexOf(' ', 120)) + '...';
+
+        // Сохраняем в историю чата комнаты
+        room.chatLog.push({ name: bot.name, msg, ts: Date.now() });
+        if (room.chatLog.length > 50) room.chatLog = room.chatLog.slice(-50);
+
+        roomEmit(room, 'game_log', { msg: bot.name + ': ' + msg, cls: 'chat' });
+    } catch (e) {
+        console.error('[Claude Bot] Ошибка:', e.message);
+        // Fallback на шаблон
+        fallbackSay(room, bot, situation === 'accuse' ? 'accuse' : 'discuss', extra);
+    }
+}
+
+// Сохранять сообщения людей в историю чата комнаты
+function logHumanChat(room, playerName, msg) {
+    if (!room.chatLog) room.chatLog = [];
+    room.chatLog.push({ name: playerName, msg, ts: Date.now() });
+    if (room.chatLog.length > 50) room.chatLog = room.chatLog.slice(-50);
+}
 
 // ── Хранилище состояния ────────────────────────────────────
 const queue  = new Map();  // uid → { uid, name, avatar, socketId, joinedAt }
@@ -271,6 +439,88 @@ function startIntroductions(room) {
     room.timers.push(t);
 }
 
+// ── Вспомогательные функции для ботов ────────────────────
+
+// Случайная задержка в диапазоне
+function rndDelay(minMs, maxMs) {
+    return Math.floor(Math.random() * (maxMs - minMs)) + minMs;
+}
+
+// Проверить: все живые боты выполнили нужное действие?
+function allBotsDone(room, phase, actionKey) {
+    const aliveBots = room.players.filter(p => p.isBot && !room.dead.includes(p.uid));
+    if (phase === 'vote') {
+        return aliveBots.every(b => room.actions[b.uid] !== undefined);
+    }
+    if (actionKey) {
+        const done = room.actions[actionKey] || {};
+        const botsWithRole = aliveBots.filter(b => {
+            if (actionKey === 'kill') return b.role === 'mafia';
+            if (actionKey === 'save') return b.role === 'doctor';
+            if (actionKey === 'investigate') return b.role === 'detective';
+            return false;
+        });
+        return botsWithRole.every(b => done[b.uid]);
+    }
+    return false;
+}
+
+// Ускорить фазу если все живые люди уже проголосовали/действовали
+function tryFastForward(room, phase, resolveFunc, delayMs) {
+    const aliveHumansList = aliveHumans(room);
+    const allHumansDone = aliveHumansList.every(p => {
+        if (phase === 'vote') return room.actions[p.uid] !== undefined;
+        // для ночи — хватит что мафия среди людей выбрала
+        return true;
+    });
+    if (allHumansDone && allBotsDone(room, phase)) {
+        // Все действовали — можно ускорить
+        const t = setTimeout(() => resolveFunc(room), delayMs || 2000);
+        room.timers.push(t);
+        return true;
+    }
+    return false;
+}
+
+// ── Память ботов ──────────────────────────────────────────
+// room.botMemory = { [botUid]: { suspects: {uid: score}, confirmed: {uid: bool} } }
+function getBotMemory(room, botUid) {
+    if (!room.botMemory) room.botMemory = {};
+    if (!room.botMemory[botUid]) {
+        room.botMemory[botUid] = { suspects: {}, confirmed: {} };
+    }
+    return room.botMemory[botUid];
+}
+
+function botSuspectScore(room, botUid, targetUid) {
+    const mem = getBotMemory(room, botUid);
+    return mem.suspects[targetUid] || 0;
+}
+
+function botAddSuspicion(room, botUid, targetUid, delta) {
+    const mem = getBotMemory(room, botUid);
+    mem.suspects[targetUid] = (mem.suspects[targetUid] || 0) + delta;
+}
+
+// Выбрать лучшую цель для бота с учётом памяти
+function botPickTarget(room, bot, candidates) {
+    if (candidates.length === 0) return null;
+    const mem = getBotMemory(room, bot.uid);
+    // Сначала — подтверждённые мафиози (от детектива)
+    const confirmed = candidates.find(p => mem.confirmed[p.uid] === true);
+    if (confirmed) return confirmed;
+    // Затем — наиболее подозреваемый
+    const sorted = [...candidates].sort((a, b) =>
+        (mem.suspects[b.uid] || 0) - (mem.suspects[a.uid] || 0)
+    );
+    // 70% шанс выбрать наиболее подозреваемого, 30% — случайного (реализм)
+    if (Math.random() < 0.7 && (mem.suspects[sorted[0].uid] || 0) > 0) {
+        return sorted[0];
+    }
+    return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
+// ── День ──────────────────────────────────────────────────
 function startDay(room) {
     room.phase = 'day';
     room.day++;
@@ -278,24 +528,138 @@ function startDay(room) {
     roomEmit(room, 'day_start', { day: room.day });
     roomEmit(room, 'game_log', { msg: `☀️ День ${room.day}. Обсуждайте, кто из вас мафия.`, cls: 'system' });
 
-    const t = setTimeout(() => startVote(room), 60000); // 60с обсуждение
+    // Боты пишут в чат через Claude AI
+    const aliveBots = room.players.filter(p => p.isBot && !room.dead.includes(p.uid));
+    const aliveList = alivePlayers(room);
+
+    // Утреннее сообщение если кто-то погиб ночью
+    const lastVictim = room._lastNightVictim;
+    room._lastNightVictim = null;
+
+    aliveBots.forEach((bot, botIdx) => {
+        const mem = getBotMemory(room, bot.uid);
+
+        // Первое сообщение — реакция на утро / жертву ночи
+        const firstDelay = rndDelay(2000 + botIdx * 1500, 5000 + botIdx * 1500);
+        const t1 = setTimeout(async () => {
+            if (room.phase !== 'day' || room.dead.includes(bot.uid)) return;
+            await botSayAI(room, bot, 'morning', lastVictim ? { victim: lastVictim } : null);
+        }, firstDelay);
+        room.timers.push(t1);
+
+        // Второе сообщение — обвинение или обсуждение
+        const secondDelay = rndDelay(10000 + botIdx * 2000, 20000 + botIdx * 2000);
+        const t2 = setTimeout(async () => {
+            if (room.phase !== 'day' || room.dead.includes(bot.uid)) return;
+
+            // Детектив: решает раскрыться или намекнуть
+            if (bot.role === 'detective') {
+                const foundMafia = Object.entries(mem.confirmed).find(([uid, isMafia]) => isMafia);
+                if (foundMafia) {
+                    const target = aliveList.find(p => p.uid === foundMafia[0] && !room.dead.includes(p.uid));
+                    if (target) {
+                        await botSayAI(room, bot, 'detective_reveal', { name: target.name });
+                        botAddSuspicion(room, bot.uid, target.uid, 10);
+                        // Подталкивает других ботов
+                        aliveBots.filter(b => b.uid !== bot.uid && b.role !== 'mafia').forEach(ally => {
+                            botAddSuspicion(room, ally.uid, target.uid, 3);
+                        });
+                        return;
+                    }
+                }
+            }
+
+            // Мафия: обвиняет мирного (предпочтительно детектива/доктора)
+            if (bot.role === 'mafia') {
+                const innocents = aliveList.filter(p => p.uid !== bot.uid && p.role !== 'mafia');
+                if (innocents.length > 0 && Math.random() < 0.65) {
+                    const priority = innocents.filter(p => p.role === 'detective' || p.role === 'doctor');
+                    const target = priority.length > 0 && Math.random() < 0.5
+                        ? priority[Math.floor(Math.random() * priority.length)]
+                        : innocents[Math.floor(Math.random() * innocents.length)];
+                    await botSayAI(room, bot, 'accuse', { name: target.name });
+                    // Мафия сеет подозрение у других ботов
+                    aliveBots.filter(b => b.uid !== bot.uid && b.role !== 'mafia').forEach(ally => {
+                        botAddSuspicion(room, ally.uid, target.uid, 1);
+                    });
+                    return;
+                }
+            }
+
+            // Остальные: обвиняют подозреваемого или просто обсуждают
+            const topSuspect = aliveList
+                .filter(p => p.uid !== bot.uid && !room.dead.includes(p.uid) && (mem.suspects[p.uid] || 0) > 0)
+                .sort((a, b) => (mem.suspects[b.uid] || 0) - (mem.suspects[a.uid] || 0))[0];
+
+            if (topSuspect && Math.random() < 0.65) {
+                await botSayAI(room, bot, 'accuse', { name: topSuspect.name });
+            } else {
+                await botSayAI(room, bot, 'discuss');
+            }
+        }, secondDelay);
+        room.timers.push(t2);
+
+        // Третье сообщение — реакция на обвинение или доп. аргумент (50% шанс)
+        if (Math.random() < 0.5) {
+            const thirdDelay = rndDelay(22000 + botIdx * 1000, DAY_DISCUSS_MS - 3000);
+            const t3 = setTimeout(async () => {
+                if (room.phase !== 'day' || room.dead.includes(bot.uid)) return;
+                // Если бота недавно обвинили — защищается
+                if (room._recentAccusations && room._recentAccusations[bot.uid]) {
+                    await botSayAI(room, bot, 'defend', { accuser: room._recentAccusations[bot.uid] });
+                    delete room._recentAccusations[bot.uid];
+                } else {
+                    await botSayAI(room, bot, 'discuss');
+                }
+            }, thirdDelay);
+            room.timers.push(t3);
+        }
+    });
+
+    const t = setTimeout(() => startVote(room), DAY_DISCUSS_MS);
     room.timers.push(t);
 }
 
+// ── Голосование ───────────────────────────────────────────
 function startVote(room) {
+    if (room.phase === 'vote' || room.phase === 'night' || room.phase === 'over') return;
     room.phase = 'vote';
     room.actions = {};
     roomEmit(room, 'vote_start', { timeMs: VOTE_TIME_MS });
-    roomEmit(room, 'game_log', { msg: '🗳️ Голосуйте! Кто подозреваемый?', cls: 'system' });
+    roomEmit(room, 'game_log', { msg: '🗳️ Голосование! Кто подозреваемый?', cls: 'system' });
 
-    // Боты голосуют случайно
     const aliveList = alivePlayers(room);
+
+    // Боты голосуют с умом
     room.players.filter(p => p.isBot && !room.dead.includes(p.uid)).forEach(bot => {
-        const targets = aliveList.filter(p => p.uid !== bot.uid);
-        if (targets.length > 0) {
-            const target = targets[Math.floor(Math.random() * targets.length)];
-            setTimeout(() => recordVote(room, bot.uid, target.uid), Math.random() * 5000 + 2000);
-        }
+        const delay = rndDelay(2000, 8000);
+        const t = setTimeout(() => {
+            if (room.phase !== 'vote' || room.dead.includes(bot.uid)) return;
+            const candidates = aliveList.filter(p => p.uid !== bot.uid);
+            if (candidates.length === 0) return;
+
+            let target;
+            if (bot.role === 'mafia') {
+                // Мафия голосует за мирных, предпочитая детектива/доктора
+                const priority = candidates.filter(p => p.role === 'detective' || p.role === 'doctor');
+                target = priority.length > 0 && Math.random() < 0.6
+                    ? priority[Math.floor(Math.random() * priority.length)]
+                    : botPickTarget(room, bot, candidates.filter(p => p.role !== 'mafia'));
+            } else {
+                target = botPickTarget(room, bot, candidates);
+            }
+
+            if (target) {
+                recordVote(room, bot.uid, target.uid);
+                // Добавить подозрение соседним ботам на цель
+                if (bot.role !== 'mafia') {
+                    aliveList.filter(p => p.isBot && p.uid !== bot.uid && p.role !== 'mafia').forEach(ally => {
+                        botAddSuspicion(room, ally.uid, target.uid, 0.5);
+                    });
+                }
+            }
+        }, delay);
+        room.timers.push(t);
     });
 
     const t = setTimeout(() => resolveVote(room), VOTE_TIME_MS);
@@ -306,12 +670,20 @@ function recordVote(room, voterUid, targetUid) {
     if (room.phase !== 'vote') return;
     room.actions[voterUid] = targetUid;
     roomEmit(room, 'vote_cast', { voterUid, targetUid });
+    // Попробовать ускорить если все проголосовали
+    const aliveCount = alivePlayers(room).length;
+    const voteCount = Object.keys(room.actions).length;
+    if (voteCount >= aliveCount) {
+        // Все проголосовали — завершаем через 1.5с
+        const t = setTimeout(() => resolveVote(room), 1500);
+        room.timers.push(t);
+    }
 }
 
 function resolveVote(room) {
     if (room.phase !== 'vote') return;
+    room.phase = 'resolving'; // блокируем повторный вызов
 
-    // Подсчёт голосов
     const counts = {};
     Object.values(room.actions).forEach(uid => {
         if (uid) counts[uid] = (counts[uid] || 0) + 1;
@@ -323,52 +695,122 @@ function resolveVote(room) {
         if (cnt > maxVotes) { maxVotes = cnt; eliminated = uid; }
     });
 
+    // Проверка ничьей
+    const topCount = Object.values(counts).filter(c => c === maxVotes).length;
+    if (topCount > 1) {
+        roomEmit(room, 'game_log', { msg: '🤷 Голоса разделились — ничья. Никто не выбыл.', cls: 'system' });
+        const t = setTimeout(() => startNight(room), 3000);
+        room.timers.push(t);
+        return;
+    }
+
+    // Сохранить историю голосований для контекста Claude
+    if (!room.voteHistory) room.voteHistory = [];
+    room.voteHistory.push({
+        day: room.day,
+        votes: Object.entries(room.actions).map(([voterUid, targetUid]) => {
+            const voter = room.players.find(p => p.uid === voterUid);
+            const target = room.players.find(p => p.uid === targetUid);
+            return { voter: voter ? voter.name : voterUid, target: target ? target.name : targetUid };
+        }),
+        eliminated: null // заполним ниже
+    });
+
     if (eliminated && maxVotes > 0) {
+        const victim = room.players.find(p => p.uid === eliminated);
+        // Обновить историю
+        room.voteHistory[room.voteHistory.length - 1].eliminated = victim ? victim.name : eliminated;
+
+        if (victim && victim.role !== 'mafia') {
+            // Голосовавшие против мирного — подозреваемые
+            Object.entries(room.actions).forEach(([voterUid, targetUid]) => {
+                if (targetUid === eliminated) {
+                    room.players.filter(p => p.isBot && !room.dead.includes(p.uid) && p.role !== 'mafia').forEach(bot => {
+                        botAddSuspicion(room, bot.uid, voterUid, 1.5);
+                    });
+                }
+            });
+        }
         eliminatePlayer(room, eliminated, 'vote');
         const winner = checkWin(room);
         if (winner) return endGame(room, winner);
     } else {
-        roomEmit(room, 'game_log', { msg: '🤷 Голоса разделились. Никто не выбыл.', cls: 'system' });
+        roomEmit(room, 'game_log', { msg: '🤷 Никто не набрал большинства. Никто не выбыл.', cls: 'system' });
     }
 
     const t = setTimeout(() => startNight(room), 3000);
     room.timers.push(t);
 }
 
+// ── Ночь ──────────────────────────────────────────────────
 function startNight(room) {
     room.phase = 'night';
     room.night = (room.night || 0) + 1;
     room.actions = {};
     roomEmit(room, 'night_start', {});
-    roomEmit(room, 'game_log', { msg: '🌙 Ночь ' + room.night + '. Город засыпает... Мафия просыпается.', cls: 'system' });
+    roomEmit(room, 'game_log', { msg: `🌙 Ночь ${room.night}. Город засыпает...`, cls: 'system' });
 
-    // Боты делают ночные действия
     const aliveList = alivePlayers(room);
 
-    // Мафия-боты убивают
-    room.players.filter(p => p.isBot && p.role === 'mafia' && !room.dead.includes(p.uid)).forEach(bot => {
-        const targets = aliveList.filter(p => p.role !== 'mafia');
-        if (targets.length > 0) {
-            const target = targets[Math.floor(Math.random() * targets.length)];
-            setTimeout(() => recordNightAction(room, bot.uid, 'kill', target.uid), Math.random() * 5000 + 2000);
-        }
-    });
+    // Мафия-боты координируются: выбирают одну цель
+    const mafiaBot = room.players.filter(p => p.isBot && p.role === 'mafia' && !room.dead.includes(p.uid));
+    if (mafiaBot.length > 0) {
+        // Все мафия-боты голосуют за одну цель (детектив/доктор приоритет)
+        const nonMafia = aliveList.filter(p => p.role !== 'mafia');
+        if (nonMafia.length > 0) {
+            const priority = nonMafia.filter(p => p.role === 'detective' || p.role === 'doctor');
+            const killTarget = priority.length > 0 && Math.random() < 0.65
+                ? priority[Math.floor(Math.random() * priority.length)]
+                : botPickTarget(room, mafiaBot[0], nonMafia);
 
-    // Доктор-бот лечит случайного
+            mafiaBot.forEach(bot => {
+                const delay = rndDelay(2000, 6000);
+                const t = setTimeout(() => {
+                    if (room.phase !== 'night') return;
+                    recordNightAction(room, bot.uid, 'kill', killTarget.uid);
+                }, delay);
+                room.timers.push(t);
+            });
+        }
+    }
+
+    // Доктор-бот: лечит себя или подозреваемого-не-мафию
     room.players.filter(p => p.isBot && p.role === 'doctor' && !room.dead.includes(p.uid)).forEach(bot => {
-        if (aliveList.length > 0) {
-            const target = aliveList[Math.floor(Math.random() * aliveList.length)];
-            setTimeout(() => recordNightAction(room, bot.uid, 'save', target.uid), Math.random() * 5000 + 2000);
-        }
+        const delay = rndDelay(2000, 6000);
+        const t = setTimeout(() => {
+            if (room.phase !== 'night') return;
+            // 40% — лечит себя, иначе кого-то из мирных
+            const target = Math.random() < 0.4
+                ? bot
+                : aliveList.filter(p => p.role !== 'mafia')[Math.floor(Math.random() * aliveList.filter(p => p.role !== 'mafia').length)] || bot;
+            recordNightAction(room, bot.uid, 'save', target.uid);
+        }, delay);
+        room.timers.push(t);
     });
 
-    // Детектив-бот проверяет случайного
+    // Детектив-бот: проверяет наиболее подозреваемого
     room.players.filter(p => p.isBot && p.role === 'detective' && !room.dead.includes(p.uid)).forEach(bot => {
-        const targets = aliveList.filter(p => p.uid !== bot.uid);
-        if (targets.length > 0) {
-            const target = targets[Math.floor(Math.random() * targets.length)];
-            setTimeout(() => recordNightAction(room, bot.uid, 'investigate', target.uid), Math.random() * 5000 + 2000);
-        }
+        const delay = rndDelay(2000, 5000);
+        const t = setTimeout(() => {
+            if (room.phase !== 'night') return;
+            const mem = getBotMemory(room, bot.uid);
+            // Проверяем того кого ещё не проверяли
+            const unchecked = aliveList.filter(p => p.uid !== bot.uid && mem.confirmed[p.uid] === undefined);
+            // Приоритет — наиболее подозреваемые непроверенные
+            const target = unchecked.length > 0
+                ? botPickTarget(room, bot, unchecked)
+                : aliveList.filter(p => p.uid !== bot.uid)[0];
+            if (target) {
+                recordNightAction(room, bot.uid, 'investigate', target.uid);
+                // Сохранить результат в память
+                mem.confirmed[target.uid] = (target.role === 'mafia');
+                if (target.role === 'mafia') {
+                    // Нашли мафию — максимальное подозрение на следующий день
+                    botAddSuspicion(room, bot.uid, target.uid, 10);
+                }
+            }
+        }, delay);
+        room.timers.push(t);
     });
 
     const t = setTimeout(() => resolveNight(room), NIGHT_TIME_MS);
@@ -379,15 +821,28 @@ function recordNightAction(room, uid, type, targetUid) {
     if (room.phase !== 'night') return;
     if (!room.actions[type]) room.actions[type] = {};
     room.actions[type][uid] = targetUid;
-    // Подтвердить получение действия игроку
     const sock = sockets.get(uid);
     if (sock) sock.emit('action_confirmed', { type });
+
+    // Ускорение: если все живые люди тоже завершили — резолвим раньше
+    const aliveHumansList = aliveHumans(room);
+    const needKill = room.players.some(p => !p.isBot && p.role === 'mafia' && !room.dead.includes(p.uid));
+    const needSave = room.players.some(p => !p.isBot && p.role === 'doctor' && !room.dead.includes(p.uid));
+    const needInvest = room.players.some(p => !p.isBot && p.role === 'detective' && !room.dead.includes(p.uid));
+    const humansDone = (!needKill || (room.actions['kill'] && aliveHumansList.filter(p => p.role === 'mafia').every(p => room.actions['kill'][p.uid])))
+        && (!needSave || (room.actions['save'] && aliveHumansList.filter(p => p.role === 'doctor').every(p => room.actions['save'][p.uid])))
+        && (!needInvest || (room.actions['investigate'] && aliveHumansList.filter(p => p.role === 'detective').every(p => room.actions['investigate'][p.uid])));
+    const allMafiaBotsDone = room.players.filter(p => p.isBot && p.role === 'mafia' && !room.dead.includes(p.uid)).every(p => room.actions['kill'] && room.actions['kill'][p.uid]);
+    if (humansDone && allMafiaBotsDone) {
+        const fast = setTimeout(() => resolveNight(room), 2000);
+        room.timers.push(fast);
+    }
 }
 
 function resolveNight(room) {
     if (room.phase !== 'night') return;
+    room.phase = 'resolving';
 
-    // Найти жертву мафии
     const killVotes = room.actions['kill'] || {};
     const counts = {};
     Object.values(killVotes).forEach(uid => { counts[uid] = (counts[uid] || 0) + 1; });
@@ -397,11 +852,10 @@ function resolveNight(room) {
         if (cnt > maxKills) { maxKills = cnt; killTarget = uid; }
     });
 
-    // Проверить спасение
     const saveVotes = room.actions['save'] || {};
     const savedUids = new Set(Object.values(saveVotes));
 
-    // Результат расследования
+    // Расследование — раскрыть детективам-людям
     const investVotes = room.actions['investigate'] || {};
     Object.entries(investVotes).forEach(([detUid, targetUid]) => {
         const target = room.players.find(p => p.uid === targetUid);
@@ -416,6 +870,13 @@ function resolveNight(room) {
     });
 
     if (killTarget && !savedUids.has(killTarget)) {
+        const victim = room.players.find(p => p.uid === killTarget);
+        // Боты запоминают: кого убила мафия (повышает подозрение к тем кто не реагировал)
+        room.players.filter(p => p.isBot && !room.dead.includes(p.uid) && p.role !== 'mafia').forEach(bot => {
+            botAddSuspicion(room, bot.uid, killTarget, -5); // жертва точно не мафия
+        });
+        const victimPlayer = room.players.find(p => p.uid === killTarget);
+        room._lastNightVictim = victimPlayer ? victimPlayer.name : null;
         eliminatePlayer(room, killTarget, 'night');
         const winner = checkWin(room);
         if (winner) return endGame(room, winner);
@@ -509,16 +970,40 @@ io.on('connection', async (socket) => {
         if (!room) return;
         if (!socket.uid || room.dead.includes(socket.uid)) return;
 
-        // Мафийный чат: только для мафии ночью
         const sender = room.players.find(p => p.uid === socket.uid);
+
         if (room.phase === 'night' && sender && sender.role === 'mafia') {
-            // Рассылаем только мафии
             room.players.filter(p => p.role === 'mafia' && !p.isBot).forEach(p => {
                 const sock = sockets.get(p.uid);
                 if (sock) sock.emit('game_log', { msg: `[Мафия] ${playerName}: ${msg}`, cls: 'chat mafia' });
             });
         } else if (room.phase === 'day') {
+            logHumanChat(room, playerName, msg);
             io.to(roomId).emit('game_log', { msg: `${playerName}: ${msg}`, cls: 'chat' });
+
+            // Боты реагируют на сообщения людей (30% шанс)
+            const aliveBots = room.players.filter(p => p.isBot && !room.dead.includes(p.uid));
+            aliveBots.forEach(bot => {
+                if (Math.random() > 0.3) return;
+                const delay = rndDelay(4000, 12000);
+                const t = setTimeout(async () => {
+                    if (room.phase !== 'day' || room.dead.includes(bot.uid)) return;
+                    const botMentioned = msg.toLowerCase().includes(bot.name.toLowerCase());
+                    if (botMentioned) {
+                        if (!room._recentAccusations) room._recentAccusations = {};
+                        room._recentAccusations[bot.uid] = playerName;
+                        await botSayAI(room, bot, 'defend', { accuser: playerName });
+                    } else {
+                        const otherMentioned = aliveBots.find(b => b.uid !== bot.uid && msg.toLowerCase().includes(b.name.toLowerCase()));
+                        if (otherMentioned) {
+                            await botSayAI(room, bot, 'react_accusation', { accuser: playerName, accused: otherMentioned.name });
+                        } else {
+                            await botSayAI(room, bot, 'discuss');
+                        }
+                    }
+                }, delay);
+                room.timers.push(t);
+            });
         }
     });
 
