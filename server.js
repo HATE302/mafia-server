@@ -88,62 +88,71 @@ function buildGameContext(room, bot) {
     const dead  = room.players.filter(p => room.dead.includes(p.uid));
     const mem   = getBotMemory(room, bot.uid);
 
-    // История чата (последние 20 сообщений)
-    const chatHistory = (room.chatLog || []).slice(-20)
-        .map(e => `${e.name}: ${e.msg}`)
-        .join('\n');
+    const chatHistory = (room.chatLog || []).slice(-15)
+        .map(e => `  ${e.name}: ${e.msg}`).join('\n');
 
-    // Кто как голосовал (история)
-    const voteHistory = (room.voteHistory || [])
-        .map(r => `День ${r.day}: ${r.votes.map(v => `${v.voter} → ${v.target}`).join(', ')} → выбыл: ${r.eliminated || 'никто'}`)
-        .join('\n');
+    const voteHistory = (room.voteHistory || []).slice(-3)
+        .map(r => {
+            const myVote = r.votes.find(v => v.voter === bot.name);
+            return `День ${r.day}: ${r.votes.map(v => `${v.voter}→${v.target}`).join(' ')} | выбыл: ${r.eliminated || 'никто'}${myVote ? ` (ты голосовал за ${myVote.target})` : ''}`;
+        }).join('\n');
 
-    // Что знает бот о других
-    const knowledge = alive
-        .filter(p => p.uid !== bot.uid)
-        .map(p => {
-            const score = mem.suspects[p.uid] || 0;
-            const confirmed = mem.confirmed[p.uid];
-            let info = p.name;
-            if (confirmed === true)  info += ' [ТОЧНО МАФИЯ]';
-            if (confirmed === false) info += ' [ТОЧНО НЕ МАФИЯ]';
-            else if (score > 3)      info += ' [очень подозрителен]';
-            else if (score > 1)      info += ' [немного подозрителен]';
-            else if (score < -1)     info += ' [скорее всего мирный]';
-            if (bot.role === 'mafia' && p.role === 'mafia') info += ' [твой союзник по мафии]';
-            return info;
-        })
-        .join(', ');
+    const knowledge = alive.filter(p => p.uid !== bot.uid).map(p => {
+        const score = mem.suspects[p.uid] || 0;
+        const conf  = mem.confirmed[p.uid];
+        let tag = '';
+        if (conf === true)   tag = '★МАФИЯ';
+        else if (conf === false) tag = '✓чист';
+        else if (score > 3)  tag = '⚠подозрен';
+        else if (score > 1)  tag = '?сомнит';
+        if (bot.role === 'mafia' && p.role === 'mafia') tag = '♦союзник';
+        return tag ? `${p.name}[${tag}]` : p.name;
+    }).join(', ');
 
-    const roleDesc = {
-        mafia:     'Ты — МАФИЯ. Твоя цель: скрыть это и устранить мирных. Ври убедительно, переводи стрелки.',
-        civilian:  'Ты — МИРНЫЙ ЖИТЕЛЬ. Твоя цель: вычислить и устранить мафию через голосование.',
-        doctor:    'Ты — ДОКТОР. Ты знаешь что ты доктор, но скрываешь это. Ночью спасаешь игроков. Днём ведёшь себя как мирный.',
-        detective: 'Ты — ДЕТЕКТИВ. Ночью проверяешь игроков. Используй знания тактично — не раскрывай себя раньше времени.',
+    const roleInstructions = {
+        mafia: `Ты МАФИЯ. Скрывай это любой ценой. Ври спокойно, не нервничай. Переводи подозрения на других — особенно на того кто ведёт активное расследование. Если тебя обвиняют — контратакуй: "А сам ты что делал ночью?" Никогда не признавайся.`,
+        civilian: `Ты МИРНЫЙ ЖИТЕЛЬ. Ищи противоречия. Обращай внимание на тех кто слишком много говорит ни о чём, или наоборот молчит. Апеллируй к истории голосований — кто за кого голосовал.`,
+        doctor: `Ты ДОКТОР. Внешне — обычный мирный. Не раскрывайся без крайней необходимости. Наблюдай, делай выводы, голосуй осторожно.`,
+        detective: `Ты ДЕТЕКТИВ. У тебя есть реальные данные о проверках. Используй их: намекай, задавай острые вопросы, раскрывайся когда момент критичен. Не трать козырь слишком рано.`,
     };
 
-    return {
-        systemPrompt: `Ты играешь в Мафию. Твоё имя: ${bot.name}.
-${roleDesc[bot.role] || roleDesc.civilian}
+    // Уникальные черты характера у каждого бота (по имени)
+    const personalities = {
+        'Виктор': 'Говоришь коротко и уверенно. Иногда саркастичен.',
+        'Карло':  'Нервный, перебиваешь других, говоришь быстро.',
+        'Лоренцо':'Рассудительный, ссылаешься на логику и факты.',
+        'Анна':   'Дипломатична, иногда уклончива, задаёшь вопросы.',
+        'Марко':  'Агрессивный, давишь психологически, громко обвиняешь.',
+        'Лучия':  'Тихая, но острая. Замечаешь детали которые другие пропускают.',
+        'Джузеппе':'Старый и хитрый. Говоришь притчами, намекаешь.',
+        'Роза':   'Эмоциональная, иногда истеричная, искренняя.',
+        'Энцо':   'Циничный, не доверяешь никому, всегда ищешь выгоду.',
+        'Фиора':  'Холодная и расчётливая. Говоришь факты, без эмоций.',
+    };
+    const personality = personalities[bot.name] || 'Говоришь по делу, без лишних слов.';
 
-ЖИВЫЕ ИГРОКИ: ${alive.map(p => p.name).join(', ')}
-ВЫБЫВШИЕ: ${dead.map(p => `${p.name}(${p.role})`).join(', ') || 'никто'}
-ТВОИ ЗНАНИЯ О ДРУГИХ: ${knowledge || 'пока ничего конкретного'}
+    return {
+        systemPrompt: `Ты — ${bot.name}, игрок в Мафию. Характер: ${personality}
+
+${roleInstructions[bot.role] || roleInstructions.civilian}
+
+ЖИВЫЕ: ${alive.map(p => p.name === bot.name ? `[ТЫ]${p.name}` : p.name).join(', ')}
+МЕРТВЫЕ: ${dead.map(p => `${p.name}(${p.role})`).join(', ') || 'нет'}
+ТВОЯ ОЦЕНКА ИГРОКОВ: ${knowledge || 'нет данных'}
 
 ИСТОРИЯ ГОЛОСОВАНИЙ:
-${voteHistory || 'Игра только началась'}
+${voteHistory || 'ещё не голосовали'}
 
-ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ:
-${chatHistory || 'Тишина'}
+ЧАТ (последние реплики):
+${chatHistory || '(тишина)'}
 
-ПРАВИЛА ОТВЕТА:
-- Отвечай ТОЛЬКО одной-двумя фразами. Максимум 25 слов.
-- Говори по-русски, живо и естественно
-- НЕ начинай с "Я думаю" или "Мне кажется" каждый раз
-- Можешь задавать вопросы, обвинять, защищаться, сомневаться
-- Если ты мафия — никогда не признавайся, переводи стрелки
-- Реагируй на последние сообщения в чате если есть
-- Не используй смайлики`,
+СТРОГИЕ ПРАВИЛА:
+1. Максимум 1-2 предложения. Не больше 20 слов.
+2. НИКОГДА не повторяй свои же предыдущие фразы из чата выше.
+3. Реагируй конкретно на последнюю реплику в чате если она есть.
+4. Говори В РОЛИ своего характера — кто-то нервный, кто-то холодный.
+5. Иногда задавай вопрос вместо утверждения.
+6. Без смайликов.`,
     };
 }
 
@@ -163,40 +172,62 @@ async function botSayAI(room, bot, situation, extra) {
     const ctx = buildGameContext(room, bot);
     let userPrompt = '';
 
+    // Рандомные вариации промптов чтобы ответы не повторялись
+    const r = Math.floor(Math.random() * 3);
     switch (situation) {
         case 'discuss':
-            userPrompt = 'Сейчас фаза обсуждения. Выскажись — что думаешь о ситуации?';
+            userPrompt = [
+                'Фаза обсуждения. Выскажись — что замечаешь в поведении игроков?',
+                'Твоя очередь говорить. Что тебя беспокоит в этой игре прямо сейчас?',
+                'Поделись мыслями. На кого падает твоё подозрение и почему?',
+            ][r];
             break;
         case 'accuse':
-            userPrompt = extra && extra.name
-                ? `Ты хочешь обвинить ${extra.name}. Скажи почему ты его подозреваешь.`
-                : 'Выскажи подозрение относительно кого-то из живых игроков.';
+            userPrompt = extra && extra.name ? [
+                `Обвини ${extra.name}. Приведи конкретный аргумент — ссылайся на голосования или поведение.`,
+                `Выскажись против ${extra.name}. Почему именно он/она тебя беспокоит?`,
+                `Атакуй ${extra.name} словесно. Давай, убеди других.`,
+            ][r] : 'Обвини кого-то из живых — конкретно и с аргументом.';
             break;
         case 'defend':
-            userPrompt = extra && extra.accuser
-                ? `${extra.accuser} только что обвинил тебя. Защитись!`
-                : 'Тебя подозревают. Как ты реагируешь?';
+            userPrompt = extra && extra.accuser ? [
+                `${extra.accuser} только что обвинил тебя публично. Защищайся — контратакуй или объясняйся.`,
+                `${extra.accuser} указал на тебя. Как реагируешь? Можешь переключить внимание на него.`,
+                `Тебя обвинили. Ответь резко или спокойно — по характеру.`,
+            ][r] : 'Тебя подозревают. Защитись.';
             break;
         case 'react_accusation':
-            userPrompt = extra && extra.accused && extra.accuser
-                ? `${extra.accuser} только что обвинил ${extra.accused}. Как ты реагируешь на это?`
-                : 'Кто-то только что обвинил другого игрока. Твоя реакция?';
+            userPrompt = extra && extra.accused ? [
+                `${extra.accuser} обвинил ${extra.accused}. Ты согласен? Поддержи или опровергни.`,
+                `Только что атаковали ${extra.accused}. Как ты к этому относишься?`,
+                `${extra.accuser} говорит что ${extra.accused} подозрителен. Твоё мнение?`,
+            ][r] : 'Кто-то обвинил другого. Твоя реакция?';
             break;
         case 'morning':
-            userPrompt = extra && extra.victim
-                ? `Ночью погиб ${extra.victim}. Твоя первая реакция утром?`
-                : 'Наступило утро. Что скажешь?';
+            userPrompt = extra && extra.victim ? [
+                `Ночью погиб ${extra.victim}. Первая реакция утром — что думаешь?`,
+                `${extra.victim} мёртв. Что это говорит нам о мафии?`,
+                `Потеряли ${extra.victim}. Как это меняет твою стратегию?`,
+            ][r] : [
+                'Новый день. Что скажешь первым делом?',
+                'Утро. Поделись мыслями о ситуации.',
+                'День начался. Твои наблюдения?',
+            ][r];
             break;
         case 'detective_reveal':
-            userPrompt = `Ты детектив и ЗНАЕШЬ что ${extra.name} — мафия. Реши: раскрыть себя публично или намекнуть косвенно?`;
+            userPrompt = [
+                `Ты точно знаешь что ${extra.name} — мафия. Реши прямо сейчас: раскрыться публично детективом или намекнуть косвенно?`,
+                `У тебя есть доказательство на ${extra.name}. Как будешь действовать — в открытую или хитростью?`,
+                `${extra.name} мафия — ты уверен. Самый важный момент. Что говоришь остальным?`,
+            ][r];
             break;
         default:
-            userPrompt = 'Что скажешь сейчас?';
+            userPrompt = ['Что скажешь?', 'Твой ход.', 'Выскажись.'][r];
     }
 
     try {
         const response = await anthropic.messages.create({
-            model: 'claude-haiku-4-5-20251001', // быстрая и дешёвая модель для ботов
+            model: 'claude-haiku-4-5', // быстрая и дешёвая модель для ботов
             max_tokens: 80,
             system: ctx.systemPrompt,
             messages: [{ role: 'user', content: userPrompt }]
@@ -419,8 +450,23 @@ function eliminatePlayer(room, uid, reason) {
     const p = room.players.find(p => p.uid === uid);
     const name = p ? p.name : uid;
     const role = p ? p.role : null;
-    // Раскрываем роль выбывшего всем игрокам
-    roomEmit(room, 'eliminated', { uid, name, role, reason, msg: '💀 ' + name + ' выбыл. Роль: ' + role });
+    const roleLabels = { mafia: 'Мафия', civilian: 'Мирный', doctor: 'Доктор', detective: 'Детектив' };
+    const roleLabel = roleLabels[role] || role;
+
+    // Всем — факт выбывания и роль
+    roomEmit(room, 'eliminated', { uid, name, role, reason, msg: `💀 ${name} выбыл. Роль: ${roleLabel}` });
+
+    // Мафии дополнительно — кем был убитый если убийство ночью
+    if (reason === 'night') {
+        room.players.filter(q => q.role === 'mafia' && !q.isBot && !room.dead.includes(q.uid)).forEach(mafioso => {
+            const sock = sockets.get(mafioso.uid);
+            if (sock) sock.emit('game_log', {
+                msg: `🔴 [Мафия] Вы устранили ${name} — он был ${roleLabel}`,
+                cls: 'system'
+            });
+        });
+    }
+
     console.log(`[Room ${room.id}] Выбыл: ${name} (${role}) — ${reason}`);
 }
 
@@ -670,11 +716,12 @@ function recordVote(room, voterUid, targetUid) {
     if (room.phase !== 'vote') return;
     room.actions[voterUid] = targetUid;
     roomEmit(room, 'vote_cast', { voterUid, targetUid });
-    // Попробовать ускорить если все проголосовали
+    console.log(`[Vote] ${voterUid.slice(0,8)} → ${targetUid ? targetUid.slice(0,8) : 'skip'}`);
+    // Ускорить если все проголосовали
     const aliveCount = alivePlayers(room).length;
     const voteCount = Object.keys(room.actions).length;
-    if (voteCount >= aliveCount) {
-        // Все проголосовали — завершаем через 1.5с
+    if (voteCount >= aliveCount && !room._voteResolvePending) {
+        room._voteResolvePending = true;
         const t = setTimeout(() => resolveVote(room), 1500);
         room.timers.push(t);
     }
@@ -682,7 +729,8 @@ function recordVote(room, voterUid, targetUid) {
 
 function resolveVote(room) {
     if (room.phase !== 'vote') return;
-    room.phase = 'resolving'; // блокируем повторный вызов
+    room.phase = 'resolving';
+    room._voteResolvePending = false;
 
     const counts = {};
     Object.values(room.actions).forEach(uid => {
@@ -823,18 +871,33 @@ function recordNightAction(room, uid, type, targetUid) {
     room.actions[type][uid] = targetUid;
     const sock = sockets.get(uid);
     if (sock) sock.emit('action_confirmed', { type });
+    console.log(`[Night] ${uid.slice(0,8)} → ${type} → ${targetUid ? targetUid.slice(0,8) : 'null'}`);
 
-    // Ускорение: если все живые люди тоже завершили — резолвим раньше
-    const aliveHumansList = aliveHumans(room);
-    const needKill = room.players.some(p => !p.isBot && p.role === 'mafia' && !room.dead.includes(p.uid));
-    const needSave = room.players.some(p => !p.isBot && p.role === 'doctor' && !room.dead.includes(p.uid));
-    const needInvest = room.players.some(p => !p.isBot && p.role === 'detective' && !room.dead.includes(p.uid));
-    const humansDone = (!needKill || (room.actions['kill'] && aliveHumansList.filter(p => p.role === 'mafia').every(p => room.actions['kill'][p.uid])))
-        && (!needSave || (room.actions['save'] && aliveHumansList.filter(p => p.role === 'doctor').every(p => room.actions['save'][p.uid])))
-        && (!needInvest || (room.actions['investigate'] && aliveHumansList.filter(p => p.role === 'detective').every(p => room.actions['investigate'][p.uid])));
-    const allMafiaBotsDone = room.players.filter(p => p.isBot && p.role === 'mafia' && !room.dead.includes(p.uid)).every(p => room.actions['kill'] && room.actions['kill'][p.uid]);
-    if (humansDone && allMafiaBotsDone) {
-        const fast = setTimeout(() => resolveNight(room), 2000);
+    // Ускорение: проверить все ли сделали действие
+    checkNightComplete(room);
+}
+
+function checkNightComplete(room) {
+    if (room.phase !== 'night') return;
+
+    const aliveList = alivePlayers(room);
+
+    // Для каждой роли — нужно ли её действие и выполнено ли
+    const roleDone = (role, actionKey) => {
+        const players = aliveList.filter(p => p.role === role);
+        if (players.length === 0) return true; // нет таких игроков — не нужно
+        const actions = room.actions[actionKey] || {};
+        return players.every(p => actions[p.uid] !== undefined);
+    };
+
+    const allDone = roleDone('mafia', 'kill')
+        && roleDone('doctor', 'save')
+        && roleDone('detective', 'investigate');
+
+    if (allDone && !room._nightResolvePending) {
+        room._nightResolvePending = true;
+        console.log('[Night] Все действия выполнены — завершаем через 1.5с');
+        const fast = setTimeout(() => resolveNight(room), 1500);
         room.timers.push(fast);
     }
 }
@@ -842,6 +905,7 @@ function recordNightAction(room, uid, type, targetUid) {
 function resolveNight(room) {
     if (room.phase !== 'night') return;
     room.phase = 'resolving';
+    room._nightResolvePending = false;
 
     const killVotes = room.actions['kill'] || {};
     const counts = {};
