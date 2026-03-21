@@ -772,9 +772,17 @@ function startVote(room) {
 
 function recordVote(room, voterUid, targetUid) {
     if (room.phase !== 'vote') return;
+
+    // Конвертировать числовой id в uid
+    if (typeof targetUid === 'number') {
+        const p = room.players.find(p => p.id === targetUid || p.slot === targetUid);
+        if (p) targetUid = p.uid;
+    }
+
     room.actions[voterUid] = targetUid;
     roomEmit(room, 'vote_cast', { voterUid, targetUid });
-    console.log(`[Vote] ${voterUid.slice(0,8)} → ${targetUid ? targetUid.slice(0,8) : 'skip'}`);
+    const tStr = targetUid ? String(targetUid).slice(0,8) : 'skip';
+    console.log(`[Vote] ${String(voterUid).slice(0,8)} → ${tStr}`);
     // Ускорить если все проголосовали
     const aliveCount = alivePlayers(room).length;
     const voteCount = Object.keys(room.actions).length;
@@ -932,13 +940,24 @@ function startNight(room) {
 
 function recordNightAction(room, uid, type, targetUid) {
     if (room.phase !== 'night') return;
+
+    // Конвертировать числовой id в uid если клиент прислал число
+    if (typeof targetUid === 'number') {
+        const p = room.players.find(p => p.id === targetUid || p.slot === targetUid);
+        if (p) targetUid = p.uid;
+        else { console.warn('[Night] targetUid число но игрок не найден:', targetUid); return; }
+    }
+    if (!targetUid || typeof targetUid !== 'string') {
+        console.warn('[Night] некорректный targetUid:', targetUid);
+        return;
+    }
+
     if (!room.actions[type]) room.actions[type] = {};
     room.actions[type][uid] = targetUid;
     const sock = sockets.get(uid);
     if (sock) sock.emit('action_confirmed', { type });
-    console.log(`[Night] ${uid.slice(0,8)} → ${type} → ${targetUid ? targetUid.slice(0,8) : 'null'}`);
+    console.log(`[Night] ${String(uid).slice(0,8)} → ${type} → ${String(targetUid).slice(0,8)}`);
 
-    // Ускорение: проверить все ли сделали действие
     checkNightComplete(room);
 }
 
