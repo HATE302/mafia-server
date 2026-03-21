@@ -258,25 +258,18 @@ async function botSayAI(room, bot, situation, extra) {
     }
 
     try {
-        const response = await anthropic.messages.create({
-            model: 'claude-haiku-4-5', // быстрая и дешёвая модель для ботов
-            max_tokens: 80,
-            system: ctx.systemPrompt,
-            messages: [{ role: 'user', content: userPrompt }]
-        });
+        const text = await callGroq(ctx.systemPrompt, userPrompt);
+        if (!text) throw new Error('empty response');
 
-        let msg = response.content[0]?.text?.trim() || '...';
-        // Обрезаем если слишком длинно
+        let msg = text.replace(/^["«»]|["«»]$/g, '').trim();
         if (msg.length > 120) msg = msg.substring(0, msg.lastIndexOf(' ', 120)) + '...';
 
-        // Сохраняем в историю чата комнаты
         room.chatLog.push({ name: bot.name, msg, ts: Date.now() });
         if (room.chatLog.length > 50) room.chatLog = room.chatLog.slice(-50);
 
         roomEmit(room, 'game_log', { msg: bot.name + ': ' + msg, cls: 'chat' });
     } catch (e) {
-        console.error('[Claude Bot] Ошибка:', e.message);
-        // Fallback на шаблон
+        console.error('[Groq Bot] Ошибка:', e.message);
         fallbackSay(room, bot, situation === 'accuse' ? 'accuse' : 'discuss', extra);
     }
 }
@@ -292,9 +285,12 @@ function logHumanChat(room, playerName, msg) {
 const queue  = new Map();  // uid → { uid, name, avatar, socketId, joinedAt }
 const rooms  = new Map();  // roomId → Room
 const sockets = new Map(); // uid → socket
+const reconnectTimers = new Map(); // uid → { timer, roomId }
 
 let queueTimer   = null;  // таймер ботов (один игрок)
 let groupTimer   = null;  // таймер группового запуска
+
+const RECONNECT_TIMEOUT_MS = 10000; // 10 секунд на реконнект
 
 // ── Хелперы ────────────────────────────────────────────────
 function shuffle(arr) {
@@ -820,7 +816,7 @@ function resolveVote(room) {
         return;
     }
 
-    // Сохранить историю голосований для контекста Claude
+    // Сохранить историю голосований
     if (!room.voteHistory) room.voteHistory = [];
     room.voteHistory.push({
         day: room.day,
@@ -1159,18 +1155,116 @@ io.on('connection', async (socket) => {
 
     // ── Отключение ────────────────────────────────────────
     socket.on('disconnect', () => {
-        if (socket.uid) {
-            removeFromQueue(socket.uid);
-            sockets.delete(socket.uid);
-            // Уведомить комнату если игрок был в игре
+        const uid = socket.uid;
+        console.log(`[WS] Отключение: ${socket.id}${uid ? ' uid:' + uid.slice(0,8) : ''}`);
+
+        if (uid) {
+            removeFromQueue(uid);
+            sockets.delete(uid);
+
+            // Найти комнату игрока
+            let playerRoom = null;
+            let playerInRoom = null;
             rooms.forEach(room => {
-                const p = room.players.find(p => p.uid === socket.uid);
-                if (p && !room.dead.includes(socket.uid) && room.phase !== 'over') {
-                    roomEmit(room, 'game_log', { msg: `⚠️ ${p.name} отключился.`, cls: 'system' });
+                const p = room.players.find(p => p.uid === uid);
+                if (p && !room.dead.includes(uid) && room.phase !== 'over') {
+                    playerRoom = room;
+                    playerInRoom = p;
                 }
             });
+
+            if (playerRoom && playerInRoom) {
+                // Уведомить всех — даём 10 секунд
+                roomEmit(playerRoom, 'game_log', {
+                    msg: `⚠️ ${playerInRoom.name} отключился. 10 секунд на возврат...`,
+                    cls: 'system'
+                });
+                roomEmit(playerRoom, 'player_disconnected', { uid, name: playerInRoom.name, seconds: 10 });
+
+                // Отсчёт для игрока
+                let sec = 10;
+                const countdown = setInterval(() => {
+                    sec--;
+                    roomEmit(playerRoom, 'reconnect_countdown', { uid, seconds: sec });
+                }, 1000);
+
+                const timer = setTimeout(() => {
+                    clearInterval(countdown);
+                    // Проверяем — может уже вернулся
+                    if (sockets.has(uid)) {
+                        console.log(`[Reconnect] ${uid.slice(0,8)} вернулся вовремя`);
+                        return;
+                    }
+                    // Не вернулся — выбываем
+                    const room = playerRoom;
+                    if (!room || room.phase === 'over') return;
+                    const p = room.players.find(p => p.uid === uid);
+                    if (!p || room.dead.includes(uid)) return;
+
+                    console.log(`[Reconnect] ${uid.slice(0,8)} не вернулся — выбывает`);
+                    roomEmit(room, 'game_log', {
+                        msg: `🚪 ${p.name} покинул игру (отключение).`,
+                        cls: 'system'
+                    });
+                    // Выбываем без нарушения текущей фазы
+                    room.dead.push(uid);
+                    roomEmit(room, 'eliminated', {
+                        uid, name: p.name, role: p.role, reason: 'disconnect',
+                        msg: `🚪 ${p.name} вышел из игры.`
+                    });
+                    reconnectTimers.delete(uid);
+
+                    // Проверить победу
+                    const winner = checkWin(room);
+                    if (winner) endGame(room, winner);
+                }, RECONNECT_TIMEOUT_MS);
+
+                reconnectTimers.set(uid, { timer, countdown, roomId: playerRoom.id });
+            }
         }
-        console.log(`[WS] Отключение: ${socket.id}`);
+    });
+
+    // ── Реконнект ────────────────────────────────────────
+    socket.on('rejoin', ({ roomId }) => {
+        const uid = socket.uid;
+        if (!uid) return;
+
+        // Отменить таймер выбывания
+        if (reconnectTimers.has(uid)) {
+            const { timer, countdown } = reconnectTimers.get(uid);
+            clearTimeout(timer);
+            clearInterval(countdown);
+            reconnectTimers.delete(uid);
+        }
+
+        const room = rooms.get(roomId);
+        if (!room || room.phase === 'over') return;
+        const p = room.players.find(p => p.uid === uid);
+        if (!p || room.dead.includes(uid)) return;
+
+        // Переподключаем
+        sockets.set(uid, socket);
+        socket.join(roomId);
+        console.log(`[Reconnect] ${uid.slice(0,8)} вернулся в комнату ${roomId}`);
+
+        roomEmit(room, 'game_log', { msg: `✅ ${p.name} вернулся в игру.`, cls: 'system' });
+
+        // Отправить текущее состояние игры реконнектнувшемуся
+        socket.emit('game_rejoin', {
+            roomId,
+            myUid:   uid,
+            myRole:  p.role,
+            phase:   room.phase,
+            day:     room.day,
+            dead:    room.dead,
+            players: room.players.map(pl => ({
+                uid:   pl.uid,
+                name:  pl.name,
+                slot:  pl.slot,
+                isBot: pl.isBot,
+                role:  (pl.uid === uid || (p.role === 'mafia' && pl.role === 'mafia')) ? pl.role : null
+            }))
+        });
     });
 });
 
