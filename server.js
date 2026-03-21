@@ -250,8 +250,10 @@ function eliminatePlayer(room, uid, reason) {
     room.dead.push(uid);
     const p = room.players.find(p => p.uid === uid);
     const name = p ? p.name : uid;
-    roomEmit(room, 'eliminated', { uid, name, reason });
-    console.log(`[Room ${room.id}] Выбыл: ${name} (${p ? p.role : '?'}) — ${reason}`);
+    const role = p ? p.role : null;
+    // Раскрываем роль выбывшего всем игрокам
+    roomEmit(room, 'eliminated', { uid, name, role, reason, msg: '💀 ' + name + ' выбыл. Роль: ' + role });
+    console.log(`[Room ${room.id}] Выбыл: ${name} (${role}) — ${reason}`);
 }
 
 function startIntroductions(room) {
