@@ -420,6 +420,28 @@ async function launchRoom(realPlayers) {
 
     console.log(`[Room] Создана ${roomId} | ${realPlayers.length} игроков + ${need} ботов`);
 
+    // ── Watchdog: если фаза зависла >2мин — принудительно продвигаем ──
+    const watchdog = setInterval(() => {
+        if (!rooms.has(roomId)) { clearInterval(watchdog); return; }
+        const r = rooms.get(roomId);
+        if (r.phase === 'over') { clearInterval(watchdog); return; }
+        const now = Date.now();
+        const elapsed = now - (r._phaseStart || now);
+        if (elapsed > 120000) { // 2 минуты
+            console.warn(`[Watchdog] Комната ${roomId} зависла в фазе '${r.phase}' (${Math.round(elapsed/1000)}с) — принудительный переход`);
+            r._resolving = false;
+            r._voteResolvePending = false;
+            r._nightResolvePending = false;
+            if (r.phase === 'night' || r.phase === 'resolving') {
+                resolveNight(r);
+            } else if (r.phase === 'vote') {
+                resolveVote(r);
+            } else if (r.phase === 'day') {
+                startVote(r);
+            }
+        }
+    }, 15000);
+
     // Рассылаем каждому игроку его данные
     realPlayers.forEach(p => {
         const sock = sockets.get(p.uid);
@@ -601,6 +623,10 @@ function botPickTarget(room, bot, candidates) {
 // ── День ──────────────────────────────────────────────────
 function startDay(room) {
     room.phase = 'day';
+    room._phaseStart = Date.now();
+    room._resolving = false;
+    room._voteResolvePending = false;
+    room._nightResolvePending = false;
     room.day++;
     room.actions = {};
     roomEmit(room, 'day_start', { day: room.day });
@@ -700,7 +726,7 @@ function startDay(room) {
 
 // ── Голосование ───────────────────────────────────────────
 function startVote(room) {
-    if (room.phase === 'vote' || room.phase === 'night' || room.phase === 'over') return;
+    if (room.phase === 'over') return;
     room.phase = 'vote';
     room.actions = {};
     roomEmit(room, 'vote_start', { timeMs: VOTE_TIME_MS });
@@ -752,7 +778,7 @@ function recordVote(room, voterUid, targetUid) {
     // Ускорить если все проголосовали
     const aliveCount = alivePlayers(room).length;
     const voteCount = Object.keys(room.actions).length;
-    if (voteCount >= aliveCount && !room._voteResolvePending) {
+    if (voteCount >= aliveCount && !room._voteResolvePending && !room._resolving) {
         room._voteResolvePending = true;
         const t = setTimeout(() => resolveVote(room), 1500);
         room.timers.push(t);
@@ -760,8 +786,9 @@ function recordVote(room, voterUid, targetUid) {
 }
 
 function resolveVote(room) {
-    if (room.phase !== 'vote') return;
-    room.phase = 'resolving';
+    if (room.phase !== 'vote' && room.phase !== 'resolving') return;
+    if (room._resolving) return;
+    room._resolving = true;
     room._voteResolvePending = false;
 
     const counts = {};
@@ -777,7 +804,8 @@ function resolveVote(room) {
 
     // Проверка ничьей
     const topCount = Object.values(counts).filter(c => c === maxVotes).length;
-    if (topCount > 1) {
+    if (topCount > 1 || maxVotes === 0) {
+        room._resolving = false;
         roomEmit(room, 'game_log', { msg: '🤷 Голоса разделились — ничья. Никто не выбыл.', cls: 'system' });
         const t = setTimeout(() => startNight(room), 3000);
         room.timers.push(t);
@@ -818,6 +846,7 @@ function resolveVote(room) {
         roomEmit(room, 'game_log', { msg: '🤷 Никто не набрал большинства. Никто не выбыл.', cls: 'system' });
     }
 
+    room._resolving = false;
     const t = setTimeout(() => startNight(room), 3000);
     room.timers.push(t);
 }
@@ -825,6 +854,10 @@ function resolveVote(room) {
 // ── Ночь ──────────────────────────────────────────────────
 function startNight(room) {
     room.phase = 'night';
+    room._phaseStart = Date.now();
+    room._resolving = false;
+    room._voteResolvePending = false;
+    room._nightResolvePending = false;
     room.night = (room.night || 0) + 1;
     room.actions = {};
     roomEmit(room, 'night_start', {});
@@ -910,7 +943,7 @@ function recordNightAction(room, uid, type, targetUid) {
 }
 
 function checkNightComplete(room) {
-    if (room.phase !== 'night') return;
+    if (room.phase !== 'night' || room._resolving || room._nightResolvePending) return;
 
     const aliveList = alivePlayers(room);
 
@@ -935,8 +968,9 @@ function checkNightComplete(room) {
 }
 
 function resolveNight(room) {
-    if (room.phase !== 'night') return;
-    room.phase = 'resolving';
+    if (room.phase !== 'night' && room.phase !== 'resolving') return;
+    if (room._resolving) return;
+    room._resolving = true;
     room._nightResolvePending = false;
 
     const killVotes = room.actions['kill'] || {};
@@ -982,6 +1016,7 @@ function resolveNight(room) {
         roomEmit(room, 'game_log', { msg: '🌙 Тихая ночь. Никто не погиб.', cls: 'system' });
     }
 
+    room._resolving = false;
     const t = setTimeout(() => startDay(room), 3000);
     room.timers.push(t);
 }
