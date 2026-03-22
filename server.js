@@ -295,6 +295,7 @@ const queue  = new Map();  // uid → { uid, name, avatar, skinId, socketId, joi
 const rooms  = new Map();  // roomId → Room
 const sockets = new Map(); // uid → socket
 const reconnectTimers = new Map(); // uid → { timer, roomId }
+const rejoinedPlayers = new Set();  // uid → вернулся В ИГРУ (не просто открыл сайт)
 
 let queueTimer   = null;  // таймер ботов (один игрок)
 let groupTimer   = null;  // таймер группового запуска
@@ -528,6 +529,33 @@ function eliminatePlayer(room, uid, reason) {
     }
 
     console.log(`[Room ${room.id}] Выбыл: ${name} (${role}) — ${reason}`);
+
+    // ── Разблокировать текущую фазу если она ждала этого игрока ──
+    // Вызываем после dead.push, чтобы aliveCount/aliveNonBot уже не включал выбывшего
+    if (room.phase === 'vote') {
+        // Засчитать пропуск если не голосовал
+        if (room.actions[uid] === undefined) room.actions[uid] = null;
+        const aliveCount = alivePlayers(room).length;
+        const voted = Object.keys(room.actions).length;
+        console.log(`[Vote] После выбывания ${name}: ${voted} голосов / ${aliveCount} живых`);
+        if (voted >= aliveCount && !room._voteResolvePending && !room._resolving) {
+            room._voteResolvePending = true;
+            const t = setTimeout(() => resolveVote(room), 1500);
+            room.timers.push(t);
+        }
+    }
+    if (room.phase === 'night') {
+        // Засчитать пропуск если не действовал
+        const roleActionMap = { mafia: 'kill', doctor: 'save', detective: 'investigate' };
+        const actionKey = roleActionMap[role];
+        if (actionKey) {
+            if (!room.actions[actionKey]) room.actions[actionKey] = {};
+            if (room.actions[actionKey][uid] === undefined) {
+                room.actions[actionKey][uid] = '__skip__';
+            }
+        }
+        checkNightComplete(room);
+    }
 }
 
 function startIntroductions(room) {
@@ -1198,6 +1226,7 @@ io.on('connection', async (socket) => {
         if (uid) {
             removeFromQueue(uid);
             sockets.delete(uid);
+            rejoinedPlayers.delete(uid);
 
             // Найти комнату игрока
             let playerRoom = null;
@@ -1227,9 +1256,10 @@ io.on('connection', async (socket) => {
 
                 const timer = setTimeout(() => {
                     clearInterval(countdown);
-                    // Проверяем — может уже вернулся
-                    if (sockets.has(uid)) {
-                        console.log(`[Reconnect] ${uid.slice(0,8)} вернулся вовремя`);
+                    // Проверяем — вернулся ли игрок ИМЕННО В ИГРУ (rejoin), не просто открыл сайт
+                    if (rejoinedPlayers.has(uid)) {
+                        rejoinedPlayers.delete(uid);
+                        console.log(`[Reconnect] ${uid.slice(0,8)} вернулся в игру вовремя`);
                         return;
                     }
                     // Не вернулся — выбываем
@@ -1250,28 +1280,7 @@ io.on('connection', async (socket) => {
                     const winner = checkWin(room);
                     if (winner) { endGame(room, winner); return; }
 
-                    // Если игра в фазе голосования — поставить пропуск за вышедшего
-                    // чтобы игра не зависала в ожидании его голоса
-                    if (room.phase === 'vote' && !room.actions[uid]) {
-                        room.actions[uid] = null; // abstain
-                        const aliveNonBot = room.players.filter(q =>
-                            !q.isBot && !room.dead.includes(q.uid)
-                        ).length;
-                        const voted = Object.keys(room.actions).length;
-                        console.log(`[Vote] После кика: ${voted}/${aliveNonBot} проголосовали`);
-                        // Если все живые реальные игроки уже проголосовали — разрешаем
-                        if (voted >= aliveNonBot && !room._voteResolvePending && !room._resolving) {
-                            room._voteResolvePending = true;
-                            const t2 = setTimeout(() => resolveVote(room), 1500);
-                            room.timers.push(t2);
-                        }
-                    }
-
-                    // Если ночь — поставить пустое действие чтобы не зависало
-                    if (room.phase === 'night' && !room.actions[uid]) {
-                        room.actions[uid] = '__skip__';
-                        checkNightComplete(room);
-                    }
+                    // Разблокировка фазы встроена в eliminatePlayer — дополнительного кода не нужно
                 }, RECONNECT_TIMEOUT_MS);
 
                 reconnectTimers.set(uid, { timer, countdown, roomId: playerRoom.id });
@@ -1279,10 +1288,44 @@ io.on('connection', async (socket) => {
         }
     });
 
+    // ── Отказ от возврата в игру ────────────────────────
+    socket.on('decline_rejoin', ({ roomId }) => {
+        const uid = socket.uid;
+        if (!uid) return;
+
+        // Отменить таймер реконнекта если ещё тикает
+        if (reconnectTimers.has(uid)) {
+            const { timer, countdown } = reconnectTimers.get(uid);
+            clearTimeout(timer);
+            clearInterval(countdown);
+            reconnectTimers.delete(uid);
+        }
+
+        const room = rooms.get(roomId);
+        if (!room || room.phase === 'over') return;
+        const p = room.players.find(p => p.uid === uid);
+        if (!p || room.dead.includes(uid)) return;
+
+        console.log(`[Decline] uid=${uid.slice(0,8)} roomId=${roomId} phase=${room.phase}`);
+        roomEmit(room, 'game_log', {
+            msg: `🚪 ${p.name} покинул игру.`,
+            cls: 'system'
+        });
+        eliminatePlayer(room, uid, 'disconnect');
+
+        const winner = checkWin(room);
+        if (winner) { endGame(room, winner); return; }
+
+        // Разблокировка фазы встроена в eliminatePlayer
+    });
+
     // ── Реконнект ────────────────────────────────────────
     socket.on('rejoin', ({ roomId }) => {
         const uid = socket.uid;
         if (!uid) return;
+
+        // Пометить что игрок РЕАЛЬНО вернулся в игру
+        rejoinedPlayers.add(uid);
 
         // Отменить таймер выбывания
         if (reconnectTimers.has(uid)) {
