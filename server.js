@@ -61,6 +61,15 @@ async function callGroq(systemPrompt, userPrompt) {
 
 const app    = express();
 const server = http.createServer(app);
+
+// CORS для HTTP-эндпоинтов (нужно для /rejoin-check)
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
 const io     = new Server(server, {
     cors: {
         origin: '*',   // при деплое замените на ваш домен
@@ -290,7 +299,7 @@ const reconnectTimers = new Map(); // uid → { timer, roomId }
 let queueTimer   = null;  // таймер ботов (один игрок)
 let groupTimer   = null;  // таймер группового запуска
 
-const RECONNECT_TIMEOUT_MS = 10000; // 10 секунд на реконнект
+const RECONNECT_TIMEOUT_MS = 20000; // 20 секунд на реконнект
 
 // ── Хелперы ────────────────────────────────────────────────
 function shuffle(arr) {
@@ -852,6 +861,7 @@ function resolveVote(room) {
     }
 
     room._resolving = false;
+    roomEmit(room, 'vote_resolved', {});
     const t = setTimeout(() => startNight(room), 3000);
     room.timers.push(t);
 }
@@ -1054,6 +1064,11 @@ function resolveNight(room) {
     }
 
     room._resolving = false;
+    roomEmit(room, 'night_resolved', {
+        killed: (killTarget && !savedUids.has(killTarget)) ? killTarget : null,
+        saved:  (killTarget && savedUids.has(killTarget))  ? killTarget : null,
+        day:    room.day
+    });
     const t = setTimeout(() => startDay(room), 3000);
     room.timers.push(t);
 }
@@ -1198,13 +1213,13 @@ io.on('connection', async (socket) => {
             if (playerRoom && playerInRoom) {
                 // Уведомить всех — даём 10 секунд
                 roomEmit(playerRoom, 'game_log', {
-                    msg: `⚠️ ${playerInRoom.name} отключился. 10 секунд на возврат...`,
+                    msg: `⚠️ ${playerInRoom.name} отключился. 20 секунд на возврат...`,
                     cls: 'system'
                 });
-                roomEmit(playerRoom, 'player_disconnected', { uid, name: playerInRoom.name, seconds: 10 });
+                roomEmit(playerRoom, 'player_disconnected', { uid, name: playerInRoom.name, seconds: 20 });
 
                 // Отсчёт для игрока
-                let sec = 10;
+                let sec = 20;
                 const countdown = setInterval(() => {
                     sec--;
                     roomEmit(playerRoom, 'reconnect_countdown', { uid, seconds: sec });
@@ -1314,5 +1329,29 @@ app.get('/', (req, res) => res.json({
     queue: queue.size,
     rooms: rooms.size
 }));
+
+// ── Проверка активной комнаты для реконнекта ───────────────
+// GET /rejoin-check?uid=XXX
+// Возвращает: { found: true, roomId, phase, day } или { found: false }
+app.get('/rejoin-check', (req, res) => {
+    const uid = req.query.uid;
+    if (!uid) return res.json({ found: false });
+    let found = false;
+    rooms.forEach(room => {
+        if (found) return;
+        const p = room.players.find(p => p.uid === uid);
+        if (p && !room.dead.includes(uid) && room.phase !== 'over') {
+            found = true;
+            res.json({
+                found: true,
+                roomId: room.id,
+                phase: room.phase,
+                day: room.day,
+                playerName: p.name
+            });
+        }
+    });
+    if (!found) res.json({ found: false });
+});
 
 server.listen(PORT, () => console.log(`[Server] Запущен на порту ${PORT}`));
