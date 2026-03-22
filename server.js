@@ -626,7 +626,7 @@ function startDay(room) {
     room._nightResolvePending = false;
     room.day++;
     room.actions = {};
-    roomEmit(room, 'day_start', { day: room.day });
+    roomEmit(room, 'day_start', { day: room.day, discussionSeconds: 30 });
     roomEmit(room, 'game_log', { msg: `☀️ День ${room.day}. Обсуждайте, кто из вас мафия.`, cls: 'system' });
 
     // Боты пишут в чат через Claude AI
@@ -854,6 +854,27 @@ function resolveVote(room) {
     room._resolving = false;
     const t = setTimeout(() => startNight(room), 3000);
     room.timers.push(t);
+}
+
+// ── Проверка завершения ночи (при дисконнекте) ────────────
+function checkNightComplete(room) {
+    if (room.phase !== 'night' || room._nightResolvePending) return;
+    // Собрать живых реальных игроков с активными ролями
+    const needAction = room.players.filter(p =>
+        !p.isBot && !room.dead.includes(p.uid) &&
+        ['mafia', 'doctor', 'detective'].includes(p.role)
+    );
+    const doneCount = needAction.filter(p =>
+        room.actions[p.uid] !== undefined
+    ).length;
+    if (doneCount >= needAction.length) {
+        room._nightResolvePending = true;
+        const t2 = setTimeout(() => {
+            room._nightResolvePending = false;
+            roomEmit(room, 'night_resolve', {});
+        }, 1500);
+        room.timers.push(t2);
+    }
 }
 
 // ── Ночь ──────────────────────────────────────────────────
@@ -1207,17 +1228,35 @@ io.on('connection', async (socket) => {
                         msg: `🚪 ${p.name} покинул игру (отключение).`,
                         cls: 'system'
                     });
-                    // Выбываем без нарушения текущей фазы
-                    room.dead.push(uid);
-                    roomEmit(room, 'eliminated', {
-                        uid, name: p.name, role: p.role, reason: 'disconnect',
-                        msg: `🚪 ${p.name} вышел из игры.`
-                    });
+                    eliminatePlayer(room, uid, 'disconnect');
                     reconnectTimers.delete(uid);
 
                     // Проверить победу
                     const winner = checkWin(room);
-                    if (winner) endGame(room, winner);
+                    if (winner) { endGame(room, winner); return; }
+
+                    // Если игра в фазе голосования — поставить пропуск за вышедшего
+                    // чтобы игра не зависала в ожидании его голоса
+                    if (room.phase === 'vote' && !room.actions[uid]) {
+                        room.actions[uid] = null; // abstain
+                        const aliveNonBot = room.players.filter(q =>
+                            !q.isBot && !room.dead.includes(q.uid)
+                        ).length;
+                        const voted = Object.keys(room.actions).length;
+                        console.log(`[Vote] После кика: ${voted}/${aliveNonBot} проголосовали`);
+                        // Если все живые реальные игроки уже проголосовали — разрешаем
+                        if (voted >= aliveNonBot && !room._voteResolvePending && !room._resolving) {
+                            room._voteResolvePending = true;
+                            const t2 = setTimeout(() => resolveVote(room), 1500);
+                            room.timers.push(t2);
+                        }
+                    }
+
+                    // Если ночь — поставить пустое действие чтобы не зависало
+                    if (room.phase === 'night' && !room.actions[uid]) {
+                        room.actions[uid] = '__skip__';
+                        checkNightComplete(room);
+                    }
                 }, RECONNECT_TIMEOUT_MS);
 
                 reconnectTimers.set(uid, { timer, countdown, roomId: playerRoom.id });
