@@ -282,7 +282,7 @@ function logHumanChat(room, playerName, msg) {
 }
 
 // ── Хранилище состояния ────────────────────────────────────
-const queue  = new Map();  // uid → { uid, name, avatar, socketId, joinedAt }
+const queue  = new Map();  // uid → { uid, name, avatar, skinId, socketId, joinedAt }
 const rooms  = new Map();  // roomId → Room
 const sockets = new Map(); // uid → socket
 const reconnectTimers = new Map(); // uid → { timer, roomId }
@@ -451,6 +451,7 @@ async function launchRoom(realPlayers) {
                 uid:    pl.uid,
                 name:   pl.name,
                 avatar: pl.avatar || '🎩',
+                skinId: pl.skinId || 'classic',
                 slot:   pl.slot,
                 isBot:  !!pl.isBot,
                 // роль не раскрываем кроме союзников по мафии
@@ -1083,9 +1084,9 @@ io.on('connection', async (socket) => {
     });
 
     // ── Войти в очередь ───────────────────────────────────
-    socket.on('join_queue', ({ name, avatar }) => {
+    socket.on('join_queue', ({ name, avatar, skinId }) => {
         if (!socket.uid) { socket.emit('error', { msg: 'Не авторизован' }); return; }
-        addToQueue({ uid: socket.uid, name: name || 'Игрок', avatar: avatar || '🎩', socketId: socket.id, joinedAt: Date.now() });
+        addToQueue({ uid: socket.uid, name: name || 'Игрок', avatar: avatar || '🎩', skinId: skinId || 'classic', socketId: socket.id, joinedAt: Date.now() });
         socket.emit('joined_queue', { uid: socket.uid });
     });
 
