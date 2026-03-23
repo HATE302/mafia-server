@@ -458,12 +458,17 @@ async function launchRoom(realPlayers) {
             myUid: p.uid,
             myRole: p.role,
             players: allPlayers.map(pl => ({
-                uid:    pl.uid,
-                name:   pl.name,
-                avatar: pl.avatar || '🎩',
-                skinId: pl.skinId || 'classic',
-                slot:   pl.slot,
-                isBot:  !!pl.isBot,
+                uid:      pl.uid,
+                name:     pl.name,
+                avatar:   pl.avatar || '🎩',
+                photoURL: pl.photoURL || null,
+                skinId:   pl.skinId || 'classic',
+                slot:     pl.slot,
+                isBot:    !!pl.isBot,
+                wins:     pl.wins  || 0,
+                losses:   pl.losses|| 0,
+                mmr:      pl.mmr   || 600,
+                calibDone:!!pl.calibDone,
                 // роль не раскрываем кроме союзников по мафии
                 role: (pl.uid === p.uid || (p.role === 'mafia' && pl.role === 'mafia'))
                     ? pl.role
@@ -1110,8 +1115,16 @@ function endGame(room, winner) {
         ? '🔴 Мафия победила! Город под контролем преступников.'
         : '🟢 Мирные жители победили! Мафия уничтожена.';
 
-    // Раскрываем все роли
-    const roleReveal = room.players.map(p => ({ uid: p.uid, name: p.name, role: p.role }));
+    // Раскрываем все роли + alive статус для post-match экрана
+    const roleReveal = room.players.map(p => ({
+        uid:    p.uid,
+        name:   p.name,
+        role:   p.role,
+        alive:  !room.dead.includes(p.uid),  // alive = not in dead list
+        isBot:  !!p.isBot,
+        avatar: p.avatar || '🎩',
+        slot:   p.slot,
+    }));
 
     roomEmit(room, 'game_over', { winner, msg, roles: roleReveal });
     console.log(`[Room ${room.id}] Игра окончена: ${winner}`);
@@ -1148,9 +1161,17 @@ io.on('connection', async (socket) => {
     });
 
     // ── Войти в очередь ───────────────────────────────────
-    socket.on('join_queue', ({ name, avatar, skinId }) => {
+    socket.on('join_queue', ({ name, avatar, skinId, photoURL, wins, losses, mmr, calibDone }) => {
         if (!socket.uid) { socket.emit('error', { msg: 'Не авторизован' }); return; }
-        addToQueue({ uid: socket.uid, name: name || 'Игрок', avatar: avatar || '🎩', skinId: skinId || 'classic', socketId: socket.id, joinedAt: Date.now() });
+        addToQueue({
+            uid: socket.uid, name: name || 'Игрок', avatar: avatar || '🎩',
+            skinId: skinId || 'classic', socketId: socket.id, joinedAt: Date.now(),
+            photoURL: photoURL || null,
+            wins:     typeof wins   === 'number' ? wins   : 0,
+            losses:   typeof losses === 'number' ? losses : 0,
+            mmr:      typeof mmr    === 'number' ? mmr    : 600,
+            calibDone: !!calibDone,
+        });
         socket.emit('joined_queue', { uid: socket.uid });
     });
 
