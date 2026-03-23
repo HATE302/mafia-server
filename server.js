@@ -326,8 +326,16 @@ function makeRoomId() {
 }
 
 function broadcastQueueSize() {
-    const sz = queue.size;
-    io.emit('queue_update', { size: sz, max: MAX_ROOM });
+    const players = [...queue.values()]
+        .sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0))
+        .map(p => ({
+            uid:       p.uid,
+            name:      p.name      || 'Игрок',
+            avatar:    p.avatar    || '🎩',
+            avatarImg: p.avatarImg || p.photoURL || null,
+            isBot:     !!p.isBot,
+        }));
+    io.emit('queue_update', { size: players.length, max: MAX_ROOM, players });
 }
 
 // ── Матчмейкинг ────────────────────────────────────────────
@@ -1167,6 +1175,7 @@ io.on('connection', async (socket) => {
         });
 
         socket.emit('auth_ok', { uid });
+        broadcastQueueSize(); // отправить текущий roster новому клиенту
         console.log(`[WS] Авторизован: ${uid.slice(0,8)}`);
 
         // Если переподключился во время активной игры — отменяем таймер выбывания
@@ -1181,10 +1190,11 @@ io.on('connection', async (socket) => {
     });
 
     // ── Войти в очередь ───────────────────────────────────
-    socket.on('join_queue', ({ name, avatar, skinId, photoURL, wins, losses, mmr, calibDone, calibrationPlayed }) => {
+    socket.on('join_queue', ({ name, avatar, avatarImg, skinId, photoURL, wins, losses, mmr, calibDone, calibrationPlayed }) => {
         if (!socket.uid) { socket.emit('error', { msg: 'Не авторизован' }); return; }
         addToQueue({
             uid: socket.uid, name: name || 'Игрок', avatar: avatar || '🎩',
+            avatarImg: avatarImg || photoURL || null,
             skinId: skinId || 'classic', socketId: socket.id, joinedAt: Date.now(),
             photoURL: photoURL || null,
             wins:              typeof wins              === 'number' ? wins              : 0,
