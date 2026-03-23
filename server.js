@@ -1154,6 +1154,13 @@ io.on('connection', async (socket) => {
             uid = 'guest_' + socket.id.slice(0, 8);
         }
 
+        // If this uid already has a socket (old connection), clean it up
+        const oldSock = sockets.get(uid);
+        if (oldSock && oldSock.id !== socket.id) {
+            console.log(`[WS] Заменяем старый сокет для ${uid.slice(0,8)}`);
+            oldSock.disconnect(true);
+        }
+
         socket.uid = uid;
         sockets.set(uid, socket);
         socket.emit('auth_ok', { uid });
@@ -1245,8 +1252,12 @@ io.on('connection', async (socket) => {
         console.log(`[WS] Отключение: ${socket.id}${uid ? ' uid:' + uid.slice(0,8) : ''}`);
 
         if (uid) {
+            // Only remove from sockets map if THIS socket is still the registered one
+            // (a newer reconnected socket may have already replaced it)
+            if (sockets.get(uid) === socket) {
+                sockets.delete(uid);
+            }
             removeFromQueue(uid);
-            sockets.delete(uid);
             rejoinedPlayers.delete(uid);
 
             // Найти комнату игрока
