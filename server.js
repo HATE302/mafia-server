@@ -899,27 +899,6 @@ function resolveVote(room) {
     room.timers.push(t);
 }
 
-// ── Проверка завершения ночи (при дисконнекте) ────────────
-function checkNightComplete(room) {
-    if (room.phase !== 'night' || room._nightResolvePending) return;
-    // Собрать живых реальных игроков с активными ролями
-    const needAction = room.players.filter(p =>
-        !p.isBot && !room.dead.includes(p.uid) &&
-        ['mafia', 'doctor', 'detective'].includes(p.role)
-    );
-    const doneCount = needAction.filter(p =>
-        room.actions[p.uid] !== undefined
-    ).length;
-    if (doneCount >= needAction.length) {
-        room._nightResolvePending = true;
-        const t2 = setTimeout(() => {
-            room._nightResolvePending = false;
-            roomEmit(room, 'night_resolve', {});
-        }, 1500);
-        room.timers.push(t2);
-    }
-}
-
 // ── Ночь ──────────────────────────────────────────────────
 function startNight(room) {
     room.phase = 'night';
