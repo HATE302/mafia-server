@@ -361,17 +361,28 @@ function addToQueue(playerInfo) {
     const prev = queue.size;
     queue.set(playerInfo.uid, playerInfo);
     broadcastQueueSize();
-    console.log(`[Queue] +${playerInfo.uid.slice(0,8)} | Размер: ${queue.size}`);
+    console.log(`[Queue] +${playerInfo.uid.slice(0,8)} MMR:${playerInfo.mmr} | Размер: ${queue.size}`);
 
     if (queue.size >= MAX_ROOM) {
-        // Комната полная — запускаем немедленно
         cancelQueueTimers();
-        launchRoom([...queue.values()].slice(0, MAX_ROOM));
+        // ── MMR-aware lobby selection ──
+        // Pick MAX_ROOM players with closest MMR spread (minimise max-min range)
+        const all = [...queue.values()];
+        let bestGroup = all.slice(0, MAX_ROOM);
+        if (all.length > MAX_ROOM) {
+            // Sort by MMR and use a sliding window to find tightest cluster
+            const sorted = all.slice().sort((a, b) => (a.mmr || 500) - (b.mmr || 500));
+            let minSpread = Infinity;
+            for (let i = 0; i <= sorted.length - MAX_ROOM; i++) {
+                const window = sorted.slice(i, i + MAX_ROOM);
+                const spread = (window[MAX_ROOM - 1].mmr || 500) - (window[0].mmr || 500);
+                if (spread < minSpread) { minSpread = spread; bestGroup = window; }
+            }
+        }
+        launchRoom(bestGroup);
     } else if (queue.size >= 2) {
-        // Новый игрок — сбрасываем таймер ожидания группы
         scheduleGroupLaunch();
     } else if (queue.size === 1) {
-        // Первый игрок — запускаем таймер ботов
         scheduleBotLaunch();
     }
 }
@@ -458,17 +469,18 @@ async function launchRoom(realPlayers) {
             myUid: p.uid,
             myRole: p.role,
             players: allPlayers.map(pl => ({
-                uid:      pl.uid,
-                name:     pl.name,
-                avatar:   pl.avatar   || '🎩',
-                photoURL: pl.photoURL || null,
-                skinId:   pl.skinId   || 'classic',
-                slot:     pl.slot,
-                isBot:    !!pl.isBot,
-                wins:     pl.wins     || 0,
-                losses:   pl.losses   || 0,
-                mmr:      pl.mmr      || 600,
-                calibDone:!!pl.calibDone,
+                uid:               pl.uid,
+                name:              pl.name,
+                avatar:            pl.avatar   || '🎩',
+                photoURL:          pl.photoURL || null,
+                skinId:            pl.skinId   || 'classic',
+                slot:              pl.slot,
+                isBot:             !!pl.isBot,
+                wins:              pl.wins     || 0,
+                losses:            pl.losses   || 0,
+                mmr:               pl.mmr      || 500,
+                calibDone:         !!pl.calibDone,
+                calibrationPlayed: pl.calibrationPlayed || 0,
                 role: (pl.uid === p.uid || (p.role === 'mafia' && pl.role === 'mafia'))
                     ? pl.role
                     : null
@@ -1169,16 +1181,17 @@ io.on('connection', async (socket) => {
     });
 
     // ── Войти в очередь ───────────────────────────────────
-    socket.on('join_queue', ({ name, avatar, skinId, photoURL, wins, losses, mmr, calibDone }) => {
+    socket.on('join_queue', ({ name, avatar, skinId, photoURL, wins, losses, mmr, calibDone, calibrationPlayed }) => {
         if (!socket.uid) { socket.emit('error', { msg: 'Не авторизован' }); return; }
         addToQueue({
             uid: socket.uid, name: name || 'Игрок', avatar: avatar || '🎩',
             skinId: skinId || 'classic', socketId: socket.id, joinedAt: Date.now(),
             photoURL: photoURL || null,
-            wins:     typeof wins   === 'number' ? wins   : 0,
-            losses:   typeof losses === 'number' ? losses : 0,
-            mmr:      typeof mmr    === 'number' ? mmr    : 600,
-            calibDone: !!calibDone,
+            wins:              typeof wins              === 'number' ? wins              : 0,
+            losses:            typeof losses            === 'number' ? losses            : 0,
+            mmr:               typeof mmr               === 'number' ? mmr               : 500,
+            calibDone:         !!calibDone,
+            calibrationPlayed: typeof calibrationPlayed === 'number' ? calibrationPlayed : 0,
         });
         socket.emit('joined_queue', { uid: socket.uid });
     });
