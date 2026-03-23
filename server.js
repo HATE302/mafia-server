@@ -460,16 +460,15 @@ async function launchRoom(realPlayers) {
             players: allPlayers.map(pl => ({
                 uid:      pl.uid,
                 name:     pl.name,
-                avatar:   pl.avatar || '🎩',
+                avatar:   pl.avatar   || '🎩',
                 photoURL: pl.photoURL || null,
-                skinId:   pl.skinId || 'classic',
+                skinId:   pl.skinId   || 'classic',
                 slot:     pl.slot,
                 isBot:    !!pl.isBot,
-                wins:     pl.wins  || 0,
-                losses:   pl.losses|| 0,
-                mmr:      pl.mmr   || 600,
+                wins:     pl.wins     || 0,
+                losses:   pl.losses   || 0,
+                mmr:      pl.mmr      || 600,
                 calibDone:!!pl.calibDone,
-                // роль не раскрываем кроме союзников по мафии
                 role: (pl.uid === p.uid || (p.role === 'mafia' && pl.role === 'mafia'))
                     ? pl.role
                     : null
@@ -1094,22 +1093,22 @@ function endGame(room, winner) {
         ? '🔴 Мафия победила! Город под контролем преступников.'
         : '🟢 Мирные жители победили! Мафия уничтожена.';
 
-    // Раскрываем все роли + alive статус для post-match экрана
+    // Раскрываем все роли + alive статус + avatar для post-match экрана
     const roleReveal = room.players.map(p => ({
         uid:    p.uid,
         name:   p.name,
         role:   p.role,
-        alive:  !room.dead.includes(p.uid),  // alive = not in dead list
+        alive:  !room.dead.includes(p.uid),
         isBot:  !!p.isBot,
         avatar: p.avatar || '🎩',
-        slot:   p.slot,
     }));
 
+    room._lastWinner = winner; // сохраняем для повторной отправки при rejoin
+    console.log(`[Room ${room.id}] Игра окончена: ${winner} | игроков: ${room.players.length}`);
     roomEmit(room, 'game_over', { winner, msg, roles: roleReveal });
-    console.log(`[Room ${room.id}] Игра окончена: ${winner}`);
 
-    // Удалить комнату через 30 секунд
-    setTimeout(() => rooms.delete(room.id), 30000);
+    // Удалить комнату через 60 секунд (больше времени для post-match экрана)
+    setTimeout(() => rooms.delete(room.id), 60000);
 }
 
 // ── Socket.io события ──────────────────────────────────────
@@ -1133,7 +1132,7 @@ io.on('connection', async (socket) => {
             uid = 'guest_' + socket.id.slice(0, 8);
         }
 
-        // If this uid already has a socket (old connection), clean it up
+        // Заменяем старый сокет если был
         const oldSock = sockets.get(uid);
         if (oldSock && oldSock.id !== socket.id) {
             console.log(`[WS] Заменяем старый сокет для ${uid.slice(0,8)}`);
@@ -1142,8 +1141,31 @@ io.on('connection', async (socket) => {
 
         socket.uid = uid;
         sockets.set(uid, socket);
+
+        // Автоматически re-join в socket.io комнату если игрок был в игре
+        // Это критично: новый сокет должен получать roomEmit события
+        let rejoinedRoom = null;
+        rooms.forEach(room => {
+            const p = room.players.find(p => p.uid === uid);
+            if (p && room.phase !== 'over') {
+                socket.join(room.id);
+                rejoinedRoom = room;
+                console.log(`[WS] Авто-rejoin сокета ${uid.slice(0,8)} в комнату ${room.id} (фаза: ${room.phase})`);
+            }
+        });
+
         socket.emit('auth_ok', { uid });
         console.log(`[WS] Авторизован: ${uid.slice(0,8)}`);
+
+        // Если переподключился во время активной игры — отменяем таймер выбывания
+        if (rejoinedRoom && reconnectTimers.has(uid)) {
+            const { timer, countdown } = reconnectTimers.get(uid);
+            clearTimeout(timer);
+            clearInterval(countdown);
+            reconnectTimers.delete(uid);
+            rejoinedPlayers.add(uid);
+            console.log(`[Reconnect] ${uid.slice(0,8)} авто-реконнект через auth`);
+        }
     });
 
     // ── Войти в очередь ───────────────────────────────────
@@ -1231,12 +1253,10 @@ io.on('connection', async (socket) => {
         console.log(`[WS] Отключение: ${socket.id}${uid ? ' uid:' + uid.slice(0,8) : ''}`);
 
         if (uid) {
-            // Only remove from sockets map if THIS socket is still the registered one
-            // (a newer reconnected socket may have already replaced it)
-            if (sockets.get(uid) === socket) {
-                sockets.delete(uid);
-            }
             removeFromQueue(uid);
+            // Only delete from sockets if this IS the current socket for this uid
+            // (a reconnected socket may have already replaced it)
+            if (sockets.get(uid) === socket) sockets.delete(uid);
             rejoinedPlayers.delete(uid);
 
             // Найти комнату игрока
@@ -1347,7 +1367,23 @@ io.on('connection', async (socket) => {
         }
 
         const room = rooms.get(roomId);
-        if (!room || room.phase === 'over') return;
+        if (!room) return;
+
+        // Если игра уже закончилась — повторно отправить game_over этому игроку
+        if (room.phase === 'over') {
+            const msg = room._lastWinner === 'mafia'
+                ? '🔴 Мафия победила! Город под контролем преступников.'
+                : '🟢 Мирные жители победили! Мафия уничтожена.';
+            const roleReveal = room.players.map(p => ({
+                uid: p.uid, name: p.name, role: p.role,
+                alive: !room.dead.includes(p.uid),
+                isBot: !!p.isBot, avatar: p.avatar || '🎩',
+            }));
+            socket.emit('game_over', { winner: room._lastWinner || 'civ', msg, roles: roleReveal });
+            console.log(`[Rejoin] ${uid.slice(0,8)} — игра уже окончена, повторяем game_over`);
+            return;
+        }
+
         const p = room.players.find(p => p.uid === uid);
         if (!p || room.dead.includes(uid)) return;
 
