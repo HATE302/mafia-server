@@ -472,7 +472,7 @@ async function launchRoom(realPlayers) {
                 uid:               pl.uid,
                 name:              pl.name,
                 avatar:            pl.avatar   || '🎩',
-                photoURL:          pl.photoURL || null,
+                photoURL:          pl.avatarImg || pl.photoURL || null,
                 skinId:            pl.skinId   || 'classic',
                 slot:              pl.slot,
                 isBot:             !!pl.isBot,
