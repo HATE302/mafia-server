@@ -101,7 +101,7 @@ try {
 }
 
 // ── Константы ──────────────────────────────────────────────
-const MAX_ROOM      = 7;
+const MAX_ROOM      = 8;
 const BOT_WAIT_MS   = 20000; // 20с ожидания перед добавлением ботов
 const GROUP_WAIT_MS = 5000;  // 5с после прихода второго игрока
 const VOTE_TIME_MS  = 45000; // 45с на голосование (боты ускоряют)
@@ -312,11 +312,9 @@ function shuffle(arr) {
 }
 
 function assignRoles(n) {
-    const numMafia = Math.max(1, Math.floor(n / 4));
-    const roles = [];
-    for (let i = 0; i < numMafia; i++) roles.push('mafia');
-    roles.push('doctor');
-    roles.push('detective');
+    // Fixed distribution for 8-player games:
+    // 2 mafia, 1 doctor, 1 detective, 4 civilians
+    const roles = ['mafia', 'mafia', 'doctor', 'detective'];
     while (roles.length < n) roles.push('civilian');
     return shuffle(roles);
 }
@@ -517,15 +515,17 @@ function aliveHumans(room) {
 function checkWin(room) {
     const alive = alivePlayers(room);
     const aliveMafia = alive.filter(p => p.role === 'mafia');
-    const aliveCiv   = alive.filter(p => p.role !== 'mafia');
+    const aliveTown  = alive.filter(p => p.role !== 'mafia');
 
-    console.log('[checkWin] alive=' + alive.length + ' mafia=' + aliveMafia.length + ' civ=' + aliveCiv.length);
+    console.log('[checkWin] alive=' + alive.length + ' mafia=' + aliveMafia.length + ' town=' + aliveTown.length);
 
-    // Защита: не объявлять победу до первого убийства
+    // No win before first elimination
     if (room.dead.length === 0) return null;
 
+    // Town wins: all mafia eliminated
     if (aliveMafia.length === 0) return 'civ';
-    if (aliveMafia.length >= aliveCiv.length) return 'mafia';
+    // Mafia wins: mafia count equals or exceeds town count
+    if (aliveMafia.length >= aliveTown.length) return 'mafia';
     return null;
 }
 
@@ -1059,6 +1059,16 @@ function resolveNight(room) {
     Object.entries(counts).forEach(([uid, cnt]) => {
         if (cnt > maxKills) { maxKills = cnt; killTarget = uid; }
     });
+
+    // Tiebreaker: if multiple targets share the top vote count,
+    // use the first-assigned mafia player's choice as the deciding vote
+    const topCandidates = Object.entries(counts).filter(([,cnt]) => cnt === maxKills);
+    if (topCandidates.length > 1) {
+        const firstMafia = room.players.find(p => p.role === 'mafia');
+        if (firstMafia && killVotes[firstMafia.uid]) {
+            killTarget = killVotes[firstMafia.uid];
+        }
+    }
 
     const saveVotes = room.actions['save'] || {};
     const savedUids = new Set(Object.values(saveVotes));
