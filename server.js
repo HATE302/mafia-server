@@ -437,7 +437,8 @@ async function launchRoom(realPlayers) {
         day:     0,
         dead:    [],
         actions: {},
-        timers:  []
+        timers:  [],
+        doctorSelfSaveUsed: {} // uid → true, если доктор уже использовал самолечение
     };
     rooms.set(roomId, room);
 
@@ -687,7 +688,8 @@ function startDay(room) {
     room._nightResolvePending = false;
     room.day++;
     room.actions = {};
-    roomEmit(room, 'day_start', { day: room.day, discussionSeconds: 30 });
+    room._botDayAccusations = {}; // botUid → targetUid — кого обвинял в чате этого дня
+    roomEmit(room, 'day_start', { day: room.day, discussionSeconds: DAY_DISCUSS_MS / 1000, serverTs: Date.now() });
     roomEmit(room, 'game_log', { msg: `☀️ День ${room.day}. Обсуждайте, кто из вас мафия.`, cls: 'system' });
 
     // Боты пишут в чат через Claude AI
@@ -722,6 +724,8 @@ function startDay(room) {
                     if (target) {
                         await botSayAI(room, bot, 'detective_reveal', { name: target.name });
                         botAddSuspicion(room, bot.uid, target.uid, 10);
+                        if (!room._botDayAccusations) room._botDayAccusations = {};
+                        room._botDayAccusations[bot.uid] = target.uid;
                         // Подталкивает других ботов
                         aliveBots.filter(b => b.uid !== bot.uid && b.role !== 'mafia').forEach(ally => {
                             botAddSuspicion(room, ally.uid, target.uid, 3);
@@ -740,6 +744,8 @@ function startDay(room) {
                         ? priority[Math.floor(Math.random() * priority.length)]
                         : innocents[Math.floor(Math.random() * innocents.length)];
                     await botSayAI(room, bot, 'accuse', { name: target.name });
+                    if (!room._botDayAccusations) room._botDayAccusations = {};
+                    room._botDayAccusations[bot.uid] = target.uid;
                     // Мафия сеет подозрение у других ботов
                     aliveBots.filter(b => b.uid !== bot.uid && b.role !== 'mafia').forEach(ally => {
                         botAddSuspicion(room, ally.uid, target.uid, 1);
@@ -755,6 +761,8 @@ function startDay(room) {
 
             if (topSuspect && Math.random() < 0.65) {
                 await botSayAI(room, bot, 'accuse', { name: topSuspect.name });
+                if (!room._botDayAccusations) room._botDayAccusations = {};
+                room._botDayAccusations[bot.uid] = topSuspect.uid;
             } else {
                 await botSayAI(room, bot, 'discuss');
             }
@@ -787,7 +795,7 @@ function startVote(room) {
     if (room.phase === 'over') return;
     room.phase = 'vote';
     room.actions = {};
-    roomEmit(room, 'vote_start', { timeMs: VOTE_TIME_MS });
+    roomEmit(room, 'vote_start', { timeMs: VOTE_TIME_MS, serverTs: Date.now() });
     roomEmit(room, 'game_log', { msg: '🗳️ Голосование! Кто подозреваемый?', cls: 'system' });
 
     const aliveList = alivePlayers(room);
@@ -801,7 +809,12 @@ function startVote(room) {
             if (candidates.length === 0) return;
 
             let target;
-            if (bot.role === 'mafia') {
+            // Сначала проверяем: обвинял ли бот кого-то в чате этого дня (80% приоритет)
+            const accusedUid = room._botDayAccusations && room._botDayAccusations[bot.uid];
+            const accusedAlive = accusedUid && candidates.find(p => p.uid === accusedUid);
+            if (accusedAlive && Math.random() < 0.8) {
+                target = accusedAlive;
+            } else if (bot.role === 'mafia') {
                 // Мафия голосует за мирных, предпочитая детектива/доктора
                 const priority = candidates.filter(p => p.role === 'detective' || p.role === 'doctor');
                 target = priority.length > 0 && Math.random() < 0.6
@@ -927,7 +940,7 @@ function startNight(room) {
     room._nightResolvePending = false;
     room.night = (room.night || 0) + 1;
     room.actions = {};
-    roomEmit(room, 'night_start', {});
+    roomEmit(room, 'night_start', { serverTs: Date.now(), durationMs: NIGHT_TIME_MS });
     roomEmit(room, 'game_log', { msg: `🌙 Ночь ${room.night}. Город засыпает...`, cls: 'system' });
 
     const aliveList = alivePlayers(room);
@@ -939,9 +952,24 @@ function startNight(room) {
         const nonMafia = aliveList.filter(p => p.role !== 'mafia');
         if (nonMafia.length > 0) {
             const priority = nonMafia.filter(p => p.role === 'detective' || p.role === 'doctor');
-            const killTarget = priority.length > 0 && Math.random() < 0.65
-                ? priority[Math.floor(Math.random() * priority.length)]
-                : botPickTarget(room, mafiaBot[0], nonMafia);
+            // Агрегируем подозрения от всех мафия-ботов
+            let killTarget;
+            if (priority.length > 0 && Math.random() < 0.65) {
+                killTarget = priority[Math.floor(Math.random() * priority.length)];
+            } else {
+                // Суммируем suspect-очки всех мафия-ботов по каждой цели
+                const aggregated = {};
+                mafiaBot.forEach(bot => {
+                    const mem = getBotMemory(room, bot.uid);
+                    nonMafia.forEach(p => {
+                        aggregated[p.uid] = (aggregated[p.uid] || 0) + (mem.suspects[p.uid] || 0);
+                    });
+                });
+                const sorted = [...nonMafia].sort((a, b) => (aggregated[b.uid] || 0) - (aggregated[a.uid] || 0));
+                killTarget = (Math.random() < 0.7 && (aggregated[sorted[0]?.uid] || 0) > 0)
+                    ? sorted[0]
+                    : nonMafia[Math.floor(Math.random() * nonMafia.length)];
+            }
 
             mafiaBot.forEach(bot => {
                 const delay = rndDelay(2000, 6000);
@@ -954,15 +982,17 @@ function startNight(room) {
         }
     }
 
-    // Доктор-бот: лечит себя или подозреваемого-не-мафию
+    // Доктор-бот: лечит себя (если ещё не использовал) или подозреваемого-не-мафию
     room.players.filter(p => p.isBot && p.role === 'doctor' && !room.dead.includes(p.uid)).forEach(bot => {
         const delay = rndDelay(2000, 6000);
         const t = setTimeout(() => {
             if (room.phase !== 'night') return;
-            // 40% — лечит себя, иначе кого-то из мирных
-            const target = Math.random() < 0.4
+            const selfSaveUsed = room.doctorSelfSaveUsed && room.doctorSelfSaveUsed[bot.uid];
+            const innocents = aliveList.filter(p => p.role !== 'mafia');
+            // 40% — лечит себя если ещё не использовал, иначе кого-то из мирных
+            const target = (!selfSaveUsed && Math.random() < 0.4)
                 ? bot
-                : aliveList.filter(p => p.role !== 'mafia')[Math.floor(Math.random() * aliveList.filter(p => p.role !== 'mafia').length)] || bot;
+                : innocents[Math.floor(Math.random() * innocents.length)] || bot;
             recordNightAction(room, bot.uid, 'save', target.uid);
         }, delay);
         room.timers.push(t);
@@ -1011,11 +1041,62 @@ function recordNightAction(room, uid, type, targetUid) {
         return;
     }
 
+    // Цель должна быть живым игроком комнаты
+    const targetPlayer = room.players.find(p => p.uid === targetUid);
+    if (!targetPlayer) {
+        console.warn('[Night] targetUid не найден в комнате:', targetUid.slice(0,8));
+        return;
+    }
+    if (room.dead.includes(targetUid)) {
+        console.warn('[Night] targetUid мёртв:', targetUid.slice(0,8));
+        return;
+    }
+    // Детектив не может расследовать себя, мафия не может убить союзника
+    const actorPlayer = room.players.find(p => p.uid === uid);
+    if (actorPlayer) {
+        if (uid === targetUid && actorPlayer.role !== 'doctor') {
+            console.warn('[Night] Игрок пытается выбрать себя (не доктор):', uid.slice(0,8));
+            return;
+        }
+        if (actorPlayer.role === 'mafia' && targetPlayer.role === 'mafia') {
+            console.warn('[Night] Мафия пытается убить союзника:', targetUid.slice(0,8));
+            return;
+        }
+        // Доктор: самолечение только один раз за игру
+        if (actorPlayer.role === 'doctor' && uid === targetUid) {
+            if (room.doctorSelfSaveUsed && room.doctorSelfSaveUsed[uid]) {
+                const sock = sockets.get(uid);
+                if (sock) sock.emit('action_error', { msg: 'Вы уже использовали самолечение в этой игре' });
+                console.warn('[Night] Доктор повторно пытается вылечить себя:', uid.slice(0,8));
+                return;
+            }
+        }
+    }
+
     if (!room.actions[type]) room.actions[type] = {};
     room.actions[type][uid] = targetUid;
     const sock = sockets.get(uid);
     if (sock) sock.emit('action_confirmed', { type });
     console.log(`[Night] ${String(uid).slice(0,8)} → ${type} → ${String(targetUid).slice(0,8)}`);
+
+    // Уведомить напарников-мафию о выборе цели убийства
+    if (type === 'kill') {
+        const actor = room.players.find(p => p.uid === uid);
+        const target = room.players.find(p => p.uid === targetUid);
+        if (actor && target) {
+            room.players
+                .filter(p => p.role === 'mafia' && !p.isBot && p.uid !== uid && !room.dead.includes(p.uid))
+                .forEach(teammate => {
+                    const tSock = sockets.get(teammate.uid);
+                    if (tSock) tSock.emit('mafia_teammate_action', {
+                        actorName:  actor.name,
+                        actorUid:   uid,
+                        targetName: target.name,
+                        targetUid:  targetUid
+                    });
+                });
+        }
+    }
 
     checkNightComplete(room);
 }
@@ -1087,6 +1168,15 @@ function resolveNight(room) {
         }
     });
 
+    // Отметить использованное самолечение доктора
+    const saveVoteEntries = room.actions['save'] || {};
+    Object.entries(saveVoteEntries).forEach(([docUid, savedUid]) => {
+        if (docUid === savedUid && savedUids.has(savedUid)) {
+            if (!room.doctorSelfSaveUsed) room.doctorSelfSaveUsed = {};
+            room.doctorSelfSaveUsed[docUid] = true;
+        }
+    });
+
     if (killTarget && !savedUids.has(killTarget)) {
         const victim = room.players.find(p => p.uid === killTarget);
         // Боты запоминают: кого убила мафия (повышает подозрение к тем кто не реагировал)
@@ -1139,6 +1229,16 @@ function endGame(room, winner) {
 
     // Удалить комнату через 60 секунд (больше времени для post-match экрана)
     setTimeout(() => rooms.delete(room.id), 60000);
+}
+
+// ── Rate limiting ──────────────────────────────────────────
+// Возвращает true если действие разрешено, false — если превышен лимит
+function rateLimit(socket, key, limitMs) {
+    const ts = socket._rl || (socket._rl = {});
+    const now = Date.now();
+    if (ts[key] && now - ts[key] < limitMs) return false;
+    ts[key] = now;
+    return true;
 }
 
 // ── Socket.io события ──────────────────────────────────────
@@ -1202,6 +1302,24 @@ io.on('connection', async (socket) => {
     // ── Войти в очередь ───────────────────────────────────
     socket.on('join_queue', ({ name, avatar, avatarImg, skinId, photoURL, wins, losses, mmr, calibDone, calibrationPlayed }) => {
         if (!socket.uid) { socket.emit('error', { msg: 'Не авторизован' }); return; }
+
+        // ── Защита от двойного входа ──
+        if (queue.has(socket.uid)) {
+            socket.emit('queue_error', { code: 'ALREADY_IN_QUEUE', msg: 'Вы уже в очереди' });
+            return;
+        }
+        // Проверить: не в активной ли игре
+        let inGame = false;
+        rooms.forEach(room => {
+            if (inGame) return;
+            const p = room.players.find(p => p.uid === socket.uid);
+            if (p && !room.dead.includes(socket.uid) && room.phase !== 'over') inGame = true;
+        });
+        if (inGame) {
+            socket.emit('queue_error', { code: 'ALREADY_IN_GAME', msg: 'Вы уже в активной игре' });
+            return;
+        }
+
         addToQueue({
             uid: socket.uid, name: name || 'Игрок', avatar: avatar || '🎩',
             avatarImg: avatarImg || photoURL || null,
@@ -1223,36 +1341,58 @@ io.on('connection', async (socket) => {
 
     // ── Ночное действие ───────────────────────────────────
     socket.on('night_action', ({ roomId, type, targetUid }) => {
+        if (!rateLimit(socket, 'night_action', 2000)) return;
         const room = rooms.get(roomId);
         if (!room || room.phase !== 'night') return;
         if (!socket.uid || room.dead.includes(socket.uid)) return;
+
+        // Валидация: тип действия должен соответствовать роли игрока
+        const player = room.players.find(p => p.uid === socket.uid);
+        if (!player) return;
+        const allowedAction = { mafia: 'kill', doctor: 'save', detective: 'investigate' }[player.role];
+        if (!allowedAction || allowedAction !== type) {
+            console.warn(`[Night] Игрок ${socket.uid.slice(0,8)} (${player.role}) попытался выполнить '${type}' — отклонено`);
+            return;
+        }
+
         recordNightAction(room, socket.uid, type, targetUid);
     });
 
     // ── Голосование ───────────────────────────────────────
     socket.on('vote', ({ roomId, targetUid }) => {
+        if (!rateLimit(socket, 'vote', 2000)) return;
         const room = rooms.get(roomId);
         if (!room || room.phase !== 'vote') return;
         if (!socket.uid || room.dead.includes(socket.uid)) return;
+        // Проверка принадлежности к комнате
+        if (!room.players.find(p => p.uid === socket.uid)) return;
         recordVote(room, socket.uid, targetUid);
     });
 
     // ── Чат ───────────────────────────────────────────────
     socket.on('chat', ({ roomId, msg, playerName }) => {
+        if (!rateLimit(socket, 'chat', 1000)) return;
         const room = rooms.get(roomId);
         if (!room) return;
         if (!socket.uid || room.dead.includes(socket.uid)) return;
 
+        // Санитизация сообщения
+        if (typeof msg !== 'string') return;
+        const cleanMsg = msg.replace(/<[^>]*>/g, '').trim().slice(0, 200);
+        if (!cleanMsg) return;
+
+        // Проверка принадлежности к комнате
         const sender = room.players.find(p => p.uid === socket.uid);
+        if (!sender) return;
 
         if (room.phase === 'night' && sender && sender.role === 'mafia') {
             room.players.filter(p => p.role === 'mafia' && !p.isBot).forEach(p => {
                 const sock = sockets.get(p.uid);
-                if (sock) sock.emit('game_log', { msg: `[Мафия] ${playerName}: ${msg}`, cls: 'chat mafia' });
+                if (sock) sock.emit('game_log', { msg: `[Мафия] ${sender.name}: ${cleanMsg}`, cls: 'chat mafia' });
             });
         } else if (room.phase === 'day') {
-            logHumanChat(room, playerName, msg);
-            io.to(roomId).emit('game_log', { msg: `${playerName}: ${msg}`, cls: 'chat' });
+            logHumanChat(room, sender.name, cleanMsg);
+            io.to(roomId).emit('game_log', { msg: `${sender.name}: ${cleanMsg}`, cls: 'chat' });
 
             // Боты реагируют на сообщения людей (30% шанс)
             const aliveBots = room.players.filter(p => p.isBot && !room.dead.includes(p.uid));
@@ -1261,15 +1401,16 @@ io.on('connection', async (socket) => {
                 const delay = rndDelay(4000, 12000);
                 const t = setTimeout(async () => {
                     if (room.phase !== 'day' || room.dead.includes(bot.uid)) return;
-                    const botMentioned = msg.toLowerCase().includes(bot.name.toLowerCase());
+                    const msgLower = cleanMsg.toLowerCase();
+                    const botMentioned = msgLower.includes(bot.name.toLowerCase());
                     if (botMentioned) {
                         if (!room._recentAccusations) room._recentAccusations = {};
-                        room._recentAccusations[bot.uid] = playerName;
-                        await botSayAI(room, bot, 'defend', { accuser: playerName });
+                        room._recentAccusations[bot.uid] = sender.name;
+                        await botSayAI(room, bot, 'defend', { accuser: sender.name });
                     } else {
-                        const otherMentioned = aliveBots.find(b => b.uid !== bot.uid && msg.toLowerCase().includes(b.name.toLowerCase()));
+                        const otherMentioned = aliveBots.find(b => b.uid !== bot.uid && msgLower.includes(b.name.toLowerCase()));
                         if (otherMentioned) {
-                            await botSayAI(room, bot, 'react_accusation', { accuser: playerName, accused: otherMentioned.name });
+                            await botSayAI(room, bot, 'react_accusation', { accuser: sender.name, accused: otherMentioned.name });
                         } else {
                             await botSayAI(room, bot, 'discuss');
                         }
@@ -1428,13 +1569,40 @@ io.on('connection', async (socket) => {
         roomEmit(room, 'game_log', { msg: `✅ ${p.name} вернулся в игру.`, cls: 'system' });
 
         // Отправить текущее состояние игры реконнектнувшемуся
+        const now = Date.now();
+        const phaseStart = room._phaseStart || now;
+        let phaseTotal = 0;
+        if (room.phase === 'night') phaseTotal = NIGHT_TIME_MS;
+        else if (room.phase === 'vote') phaseTotal = VOTE_TIME_MS;
+        else if (room.phase === 'day') phaseTotal = DAY_DISCUSS_MS;
+        const phaseTimeLeft = Math.max(0, phaseTotal - (now - phaseStart));
+
+        // Выполнил ли игрок своё ночное действие / проголосовал ли
+        let myActionDone = false;
+        if (room.phase === 'night') {
+            const actionKey = { mafia: 'kill', doctor: 'save', detective: 'investigate' }[p.role];
+            if (actionKey && room.actions[actionKey] && room.actions[actionKey][uid] !== undefined) {
+                myActionDone = true;
+            }
+        } else if (room.phase === 'vote') {
+            myActionDone = room.actions[uid] !== undefined;
+        }
+
+        const aliveCount = alivePlayers(room).length;
+        const votedCount = room.phase === 'vote' ? Object.keys(room.actions).length : 0;
+
         socket.emit('game_rejoin', {
             roomId,
-            myUid:   uid,
-            myRole:  p.role,
-            phase:   room.phase,
-            day:     room.day,
-            dead:    room.dead,
+            myUid:        uid,
+            myRole:       p.role,
+            phase:        room.phase,
+            day:          room.day,
+            night:        room.night || 0,
+            dead:         room.dead,
+            phaseTimeLeft,
+            myActionDone,
+            votedCount,
+            aliveCount,
             players: room.players.map(pl => ({
                 uid:   pl.uid,
                 name:  pl.name,
