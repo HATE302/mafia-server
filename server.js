@@ -105,7 +105,9 @@ const MAX_ROOM      = 8;
 const BOT_WAIT_MS   = 20000; // 20с ожидания перед добавлением ботов
 const GROUP_WAIT_MS = 5000;  // 5с после прихода второго игрока
 const VOTE_TIME_MS  = 45000; // 45с на голосование (боты ускоряют)
-const NIGHT_TIME_MS = 25000; // 25с на ночные действия (боты ускоряют)
+const NIGHT_TIME_MS = 25000; // 25с на ночные действия (боты ускоряют) — fallback только
+// Длительность каждой стадии ночи (staged night phase)
+const STAGE_DURATIONS = { NIGHT_START: 3000, DOCTOR_TURN: 30000, MAFIA_TURN: 45000, DETECTIVE_TURN: 30000 };
 const DAY_DISCUSS_MS = 30000;// 30с обсуждения (боты пишут в чат)
 const BOT_NAMES = ['Виктор','Карло','Лоренцо','Анна','Марко','Лучия','Джузеппе','Роза','Энцо','Фиора'];
 
@@ -938,92 +940,127 @@ function startNight(room) {
     room._resolving = false;
     room._voteResolvePending = false;
     room._nightResolvePending = false;
+    room._stageAdvancePending = false;
     room.night = (room.night || 0) + 1;
     room.actions = {};
-    roomEmit(room, 'night_start', { serverTs: Date.now(), durationMs: NIGHT_TIME_MS });
+    room.stagedNight = true; // флаг: ночь управляется стадийной машиной
+
+    roomEmit(room, 'night_start', { serverTs: Date.now() });
     roomEmit(room, 'game_log', { msg: `🌙 Ночь ${room.night}. Город засыпает...`, cls: 'system' });
+
+    nightRunStage(room, 'NIGHT_START');
+}
+
+// ── Вспомогательные функции стадийной ночи ─────────────────
+
+function nightGetStages(room) {
+    const alive = alivePlayers(room);
+    const stages = ['NIGHT_START'];
+    if (alive.some(p => p.role === 'doctor'))    stages.push('DOCTOR_TURN');
+    stages.push('MAFIA_TURN');
+    if (alive.some(p => p.role === 'detective')) stages.push('DETECTIVE_TURN');
+    stages.push('NIGHT_END');
+    return stages;
+}
+
+function nightNextStage(room) {
+    const stages = nightGetStages(room);
+    const idx = stages.indexOf(room.nightStage);
+    if (idx < 0 || idx >= stages.length - 1) return 'NIGHT_END';
+    return stages[idx + 1];
+}
+
+function nightRunStage(room, stage) {
+    if (room.phase !== 'night') return;
+    // Защита от двойного вызова одной стадии
+    if (room.nightStage === stage && stage !== 'NIGHT_START') return;
+    room.nightStage = stage;
+    room._stageAdvancePending = false;
+
+    console.log(`[Night] Стадия: ${stage}`);
+    roomEmit(room, 'night_stage', { stage });
+
+    if (stage === 'NIGHT_END') {
+        resolveNight(room);
+        return;
+    }
 
     const aliveList = alivePlayers(room);
 
-    // Мафия-боты координируются: выбирают одну цель
-    const mafiaBot = room.players.filter(p => p.isBot && p.role === 'mafia' && !room.dead.includes(p.uid));
-    if (mafiaBot.length > 0) {
-        // Все мафия-боты голосуют за одну цель (детектив/доктор приоритет)
-        const nonMafia = aliveList.filter(p => p.role !== 'mafia');
-        if (nonMafia.length > 0) {
+    // ── Запустить ботов для текущей стадии ──────────────────
+    if (stage === 'DOCTOR_TURN') {
+        room.players.filter(p => p.isBot && p.role === 'doctor' && !room.dead.includes(p.uid)).forEach(bot => {
+            const delay = rndDelay(1000, 4000);
+            const t = setTimeout(() => {
+                if (room.phase !== 'night' || room.nightStage !== 'DOCTOR_TURN') return;
+                const selfSaveUsed = room.doctorSelfSaveUsed && room.doctorSelfSaveUsed[bot.uid];
+                const innocents = alivePlayers(room).filter(p => p.role !== 'mafia');
+                const target = (!selfSaveUsed && Math.random() < 0.4)
+                    ? bot
+                    : innocents[Math.floor(Math.random() * innocents.length)] || bot;
+                recordNightAction(room, bot.uid, 'save', target.uid);
+            }, delay);
+            room.timers.push(t);
+        });
+
+    } else if (stage === 'MAFIA_TURN') {
+        const mafiaBot = room.players.filter(p => p.isBot && p.role === 'mafia' && !room.dead.includes(p.uid));
+        const nonMafia  = aliveList.filter(p => p.role !== 'mafia');
+        if (mafiaBot.length > 0 && nonMafia.length > 0) {
             const priority = nonMafia.filter(p => p.role === 'detective' || p.role === 'doctor');
-            // Агрегируем подозрения от всех мафия-ботов
             let killTarget;
             if (priority.length > 0 && Math.random() < 0.65) {
                 killTarget = priority[Math.floor(Math.random() * priority.length)];
             } else {
-                // Суммируем suspect-очки всех мафия-ботов по каждой цели
                 const aggregated = {};
                 mafiaBot.forEach(bot => {
                     const mem = getBotMemory(room, bot.uid);
-                    nonMafia.forEach(p => {
-                        aggregated[p.uid] = (aggregated[p.uid] || 0) + (mem.suspects[p.uid] || 0);
-                    });
+                    nonMafia.forEach(p => { aggregated[p.uid] = (aggregated[p.uid] || 0) + (mem.suspects[p.uid] || 0); });
                 });
                 const sorted = [...nonMafia].sort((a, b) => (aggregated[b.uid] || 0) - (aggregated[a.uid] || 0));
                 killTarget = (Math.random() < 0.7 && (aggregated[sorted[0]?.uid] || 0) > 0)
-                    ? sorted[0]
-                    : nonMafia[Math.floor(Math.random() * nonMafia.length)];
+                    ? sorted[0] : nonMafia[Math.floor(Math.random() * nonMafia.length)];
             }
-
             mafiaBot.forEach(bot => {
-                const delay = rndDelay(2000, 6000);
+                const delay = rndDelay(1000, 5000);
                 const t = setTimeout(() => {
-                    if (room.phase !== 'night') return;
+                    if (room.phase !== 'night' || room.nightStage !== 'MAFIA_TURN') return;
                     recordNightAction(room, bot.uid, 'kill', killTarget.uid);
                 }, delay);
                 room.timers.push(t);
             });
         }
+
+    } else if (stage === 'DETECTIVE_TURN') {
+        room.players.filter(p => p.isBot && p.role === 'detective' && !room.dead.includes(p.uid)).forEach(bot => {
+            const delay = rndDelay(1000, 4000);
+            const t = setTimeout(() => {
+                if (room.phase !== 'night' || room.nightStage !== 'DETECTIVE_TURN') return;
+                const mem = getBotMemory(room, bot.uid);
+                const alive2 = alivePlayers(room);
+                const unchecked = alive2.filter(p => p.uid !== bot.uid && mem.confirmed[p.uid] === undefined);
+                const target = unchecked.length > 0
+                    ? botPickTarget(room, bot, unchecked)
+                    : alive2.filter(p => p.uid !== bot.uid)[0];
+                if (target) {
+                    recordNightAction(room, bot.uid, 'investigate', target.uid);
+                    mem.confirmed[target.uid] = (target.role === 'mafia');
+                    if (target.role === 'mafia') botAddSuspicion(room, bot.uid, target.uid, 10);
+                }
+            }, delay);
+            room.timers.push(t);
+        });
     }
 
-    // Доктор-бот: лечит себя (если ещё не использовал) или подозреваемого-не-мафию
-    room.players.filter(p => p.isBot && p.role === 'doctor' && !room.dead.includes(p.uid)).forEach(bot => {
-        const delay = rndDelay(2000, 6000);
-        const t = setTimeout(() => {
-            if (room.phase !== 'night') return;
-            const selfSaveUsed = room.doctorSelfSaveUsed && room.doctorSelfSaveUsed[bot.uid];
-            const innocents = aliveList.filter(p => p.role !== 'mafia');
-            // 40% — лечит себя если ещё не использовал, иначе кого-то из мирных
-            const target = (!selfSaveUsed && Math.random() < 0.4)
-                ? bot
-                : innocents[Math.floor(Math.random() * innocents.length)] || bot;
-            recordNightAction(room, bot.uid, 'save', target.uid);
-        }, delay);
-        room.timers.push(t);
-    });
-
-    // Детектив-бот: проверяет наиболее подозреваемого
-    room.players.filter(p => p.isBot && p.role === 'detective' && !room.dead.includes(p.uid)).forEach(bot => {
-        const delay = rndDelay(2000, 5000);
-        const t = setTimeout(() => {
-            if (room.phase !== 'night') return;
-            const mem = getBotMemory(room, bot.uid);
-            // Проверяем того кого ещё не проверяли
-            const unchecked = aliveList.filter(p => p.uid !== bot.uid && mem.confirmed[p.uid] === undefined);
-            // Приоритет — наиболее подозреваемые непроверенные
-            const target = unchecked.length > 0
-                ? botPickTarget(room, bot, unchecked)
-                : aliveList.filter(p => p.uid !== bot.uid)[0];
-            if (target) {
-                recordNightAction(room, bot.uid, 'investigate', target.uid);
-                // Сохранить результат в память
-                mem.confirmed[target.uid] = (target.role === 'mafia');
-                if (target.role === 'mafia') {
-                    // Нашли мафию — максимальное подозрение на следующий день
-                    botAddSuspicion(room, bot.uid, target.uid, 10);
-                }
-            }
-        }, delay);
-        room.timers.push(t);
-    });
-
-    const t = setTimeout(() => resolveNight(room), NIGHT_TIME_MS);
+    // ── Таймаут стадии (advance если никто не успел) ────────
+    const duration = STAGE_DURATIONS[stage] || 30000;
+    const currentStage = stage;
+    const t = setTimeout(() => {
+        if (room.phase === 'night' && room.nightStage === currentStage && !room._stageAdvancePending) {
+            console.log(`[Night] Таймаут стадии ${currentStage}`);
+            nightRunStage(room, nightNextStage(room));
+        }
+    }, duration);
     room.timers.push(t);
 }
 
@@ -1099,9 +1136,36 @@ function recordNightAction(room, uid, type, targetUid) {
     }
 
     checkNightComplete(room);
+
+    // ── Стадийная машина: advance когда роль текущей стадии завершила действия ──
+    if (room.stagedNight && room.nightStage && !room._stageAdvancePending) {
+        const stageMap = {
+            DOCTOR_TURN:    { action: 'save',        role: 'doctor',    delay: 1500 },
+            MAFIA_TURN:     { action: 'kill',         role: 'mafia',     delay: 1500 },
+            DETECTIVE_TURN: { action: 'investigate',  role: 'detective', delay: 3500 },
+        };
+        const si = stageMap[room.nightStage];
+        if (si && si.action === type) {
+            const alive = alivePlayers(room);
+            const rolePlayers = alive.filter(p => p.role === si.role);
+            const done = room.actions[si.action] || {};
+            const allRoleDone = rolePlayers.length > 0 && rolePlayers.every(p => done[p.uid] !== undefined);
+            if (allRoleDone) {
+                room._stageAdvancePending = true;
+                const capturedStage = room.nightStage;
+                const t = setTimeout(() => {
+                    if (room.phase === 'night' && room.nightStage === capturedStage) {
+                        nightRunStage(room, nightNextStage(room));
+                    }
+                }, si.delay);
+                room.timers.push(t);
+            }
+        }
+    }
 }
 
 function checkNightComplete(room) {
+    if (room.stagedNight) return; // стадийная машина управляет переходами сама
     if (room.phase !== 'night' || room._resolving || room._nightResolvePending) return;
 
     const aliveList = alivePlayers(room);
@@ -1154,7 +1218,7 @@ function resolveNight(room) {
     const saveVotes = room.actions['save'] || {};
     const savedUids = new Set(Object.values(saveVotes));
 
-    // Расследование — раскрыть детективам-людям
+    // Расследование — раскрыть детективам-людям (приватно, до DawnScreen)
     const investVotes = room.actions['investigate'] || {};
     Object.entries(investVotes).forEach(([detUid, targetUid]) => {
         const target = room.players.find(p => p.uid === targetUid);
@@ -1177,30 +1241,36 @@ function resolveNight(room) {
         }
     });
 
-    if (killTarget && !savedUids.has(killTarget)) {
-        const victim = room.players.find(p => p.uid === killTarget);
-        // Боты запоминают: кого убила мафия (повышает подозрение к тем кто не реагировал)
+    // Вычислить итог ночи заранее (нужен для night_stage: NIGHT_END)
+    const victimUid  = (killTarget && !savedUids.has(killTarget)) ? killTarget : null;
+    const savedUid   = (killTarget &&  savedUids.has(killTarget)) ? killTarget : null;
+
+    // Эмитим NIGHT_END для DawnScreen через 2.5с (даём время увидеть результат детективу)
+    const nightEndT = setTimeout(() => {
+        roomEmit(room, 'night_stage', { stage: 'NIGHT_END', killed: victimUid, saved: savedUid });
+    }, 2500);
+    room.timers.push(nightEndT);
+
+    if (victimUid) {
+        // Боты запоминают: кого убила мафия
         room.players.filter(p => p.isBot && !room.dead.includes(p.uid) && p.role !== 'mafia').forEach(bot => {
-            botAddSuspicion(room, bot.uid, killTarget, -5); // жертва точно не мафия
+            botAddSuspicion(room, bot.uid, victimUid, -5);
         });
-        const victimPlayer = room.players.find(p => p.uid === killTarget);
+        const victimPlayer = room.players.find(p => p.uid === victimUid);
         room._lastNightVictim = victimPlayer ? victimPlayer.name : null;
-        eliminatePlayer(room, killTarget, 'night');
+        eliminatePlayer(room, victimUid, 'night');
         const winner = checkWin(room);
         if (winner) return endGame(room, winner);
-    } else if (killTarget && savedUids.has(killTarget)) {
+    } else if (savedUid) {
         roomEmit(room, 'game_log', { msg: '💊 Доктор спас кого-то этой ночью!', cls: 'system' });
     } else {
         roomEmit(room, 'game_log', { msg: '🌙 Тихая ночь. Никто не погиб.', cls: 'system' });
     }
 
     room._resolving = false;
-    roomEmit(room, 'night_resolved', {
-        killed: (killTarget && !savedUids.has(killTarget)) ? killTarget : null,
-        saved:  (killTarget && savedUids.has(killTarget))  ? killTarget : null,
-        day:    room.day
-    });
-    const t = setTimeout(() => startDay(room), 3000);
+    roomEmit(room, 'night_resolved', { killed: victimUid, saved: savedUid, day: room.day });
+    // day_start приходит через 5.5с — совпадает с концом DawnScreen (2.5 + 3с)
+    const t = setTimeout(() => startDay(room), 5500);
     room.timers.push(t);
 }
 
