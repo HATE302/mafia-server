@@ -978,12 +978,12 @@ function nightRunStage(room, stage) {
     room._stageAdvancePending = false;
 
     console.log(`[Night] Стадия: ${stage}`);
-    roomEmit(room, 'night_stage', { stage });
 
     if (stage === 'NIGHT_END') {
-        resolveNight(room);
+        resolveNight(room); // resolveNight сам эмитит night_stage:NIGHT_END с killed/saved
         return;
     }
+    roomEmit(room, 'night_stage', { stage });
 
     const aliveList = alivePlayers(room);
 
@@ -1260,7 +1260,11 @@ function resolveNight(room) {
         room._lastNightVictim = victimPlayer ? victimPlayer.name : null;
         eliminatePlayer(room, victimUid, 'night');
         const winner = checkWin(room);
-        if (winner) return endGame(room, winner);
+        if (winner) {
+            // Сразу эмитим NIGHT_END перед endGame (endGame очистит таймер отложенного NIGHT_END)
+            roomEmit(room, 'night_stage', { stage: 'NIGHT_END', killed: victimUid, saved: savedUid });
+            return endGame(room, winner);
+        }
     } else if (savedUid) {
         roomEmit(room, 'game_log', { msg: '💊 Доктор спас кого-то этой ночью!', cls: 'system' });
     } else {
@@ -1681,6 +1685,12 @@ io.on('connection', async (socket) => {
                 role:  (pl.uid === uid || (p.role === 'mafia' && pl.role === 'mafia')) ? pl.role : null
             }))
         });
+
+        // Восстановить ночную фазу: клиент пропустил night_stage пока был оффлайн
+        if (room.phase === 'night' && room.nightStage) {
+            socket.emit('night_stage', { stage: room.nightStage });
+            console.log(`[Reconnect] ${uid.slice(0,8)} — восстанавливаем ночную стадию: ${room.nightStage}`);
+        }
     });
 });
 
