@@ -987,13 +987,25 @@ function nightRunStage(room, stage) {
     room.nightStage = stage;
     room._stageAdvancePending = false;
 
-    console.log(`[Night] Стадия: ${stage}`);
+    console.log(`[Night] Стадия: ${stage} | room: ${room.id}`);
 
     if (stage === 'NIGHT_END') {
         resolveNight(room); // resolveNight сам эмитит night_stage:NIGHT_END с killed/saved
         return;
     }
     roomEmit(room, 'night_stage', { stage });
+
+    // ── DIRECT EMIT: гарантированная доставка night_stage каждому человеку ──
+    room.players.forEach(p => {
+        if (p.isBot) return;
+        const sock = sockets.get(p.uid);
+        if (sock && sock.connected) {
+            sock.emit('night_stage', { stage });
+            console.log(`[Night] Direct emit night_stage:${stage} → ${p.uid.slice(0,8)} (sock ${sock.id})`);
+        } else {
+            console.warn(`[Night] НЕТ сокета для ${p.uid.slice(0,8)} | sock=${!!sock} connected=${sock?.connected}`);
+        }
+    });
 
     const aliveList = alivePlayers(room);
 
@@ -1355,6 +1367,7 @@ io.on('connection', async (socket) => {
 
         socket.uid = uid;
         sockets.set(uid, socket);
+        console.log(`[WS] socket ${socket.id} → uid ${uid.slice(0,8)} | rooms: [${[...socket.rooms].join(',')}]`);
 
         // Автоматически re-join в socket.io комнату если игрок был в игре
         // Это критично: новый сокет должен получать roomEmit события
@@ -1364,6 +1377,7 @@ io.on('connection', async (socket) => {
             if (p && room.phase !== 'over') {
                 socket.join(room.id);
                 rejoinedRoom = room;
+                console.log(`[WS] auto-join room ${room.id} | phase: ${room.phase} | nightStage: ${room.nightStage || '-'} | rooms after: [${[...socket.rooms].join(',')}]`);
                 console.log(`[WS] Авто-rejoin сокета ${uid.slice(0,8)} в комнату ${room.id} (фаза: ${room.phase})`);
             }
         });
@@ -1481,7 +1495,10 @@ io.on('connection', async (socket) => {
     // ── Запрос текущей ночной стадии (fallback если broadcast не дошёл) ──
     socket.on('request_night_stage', ({ roomId } = {}) => {
         const uid = socket.uid;
-        if (!uid) return;
+        if (!uid) {
+            console.warn(`[Night] request_night_stage: socket.uid = null (socket ${socket.id})`);
+            return;
+        }
         // Найти комнату игрока
         let room = roomId ? rooms.get(roomId) : null;
         if (!room) {
@@ -1489,12 +1506,22 @@ io.on('connection', async (socket) => {
                 if (r.players.some(p => p.uid === uid) && r.phase !== 'over') room = r;
             });
         }
-        if (room && room.phase === 'night' && room.nightStage) {
-            console.log(`[Night] request_night_stage от ${uid.slice(0,8)} → ${room.nightStage}`);
-            // Убедиться что сокет в комнате (мог потеряться при реконнекте)
-            socket.join(room.id);
-            socket.emit('night_stage', { stage: room.nightStage });
+        if (!room) {
+            console.warn(`[Night] request_night_stage: комната не найдена | uid=${uid.slice(0,8)} roomId=${roomId} rooms=${rooms.size}`);
+            return;
         }
+        if (room.phase !== 'night') {
+            console.warn(`[Night] request_night_stage: фаза не night (${room.phase}) | uid=${uid.slice(0,8)}`);
+            return;
+        }
+        if (!room.nightStage) {
+            console.warn(`[Night] request_night_stage: nightStage пуст | uid=${uid.slice(0,8)}`);
+            return;
+        }
+        console.log(`[Night] request_night_stage от ${uid.slice(0,8)} → ${room.nightStage} (room ${room.id})`);
+        // Убедиться что сокет в комнате (мог потеряться при реконнекте)
+        socket.join(room.id);
+        socket.emit('night_stage', { stage: room.nightStage });
     });
 
     // ── Ночное действие ───────────────────────────────────
