@@ -505,6 +505,16 @@ async function launchRoom(realPlayers) {
 // ── Игровая логика ─────────────────────────────────────────
 function roomEmit(room, event, data) {
     io.to(room.id).emit(event, data);
+    // FIX: night_stage broadcast через io.to() не всегда доходит до клиентов.
+    // Дублируем прямой отправкой каждому человеку-игроку.
+    if (event === 'night_stage') {
+        room.players.forEach(p => {
+            if (!p.isBot) {
+                const sock = sockets.get(p.uid);
+                if (sock) sock.emit('night_stage', data);
+            }
+        });
+    }
 }
 
 function alivePlayers(room) {
@@ -1466,6 +1476,25 @@ io.on('connection', async (socket) => {
     // ── Выйти из очереди ──────────────────────────────────
     socket.on('leave_queue', () => {
         if (socket.uid) removeFromQueue(socket.uid);
+    });
+
+    // ── Запрос текущей ночной стадии (fallback если broadcast не дошёл) ──
+    socket.on('request_night_stage', ({ roomId } = {}) => {
+        const uid = socket.uid;
+        if (!uid) return;
+        // Найти комнату игрока
+        let room = roomId ? rooms.get(roomId) : null;
+        if (!room) {
+            rooms.forEach(r => {
+                if (r.players.some(p => p.uid === uid) && r.phase !== 'over') room = r;
+            });
+        }
+        if (room && room.phase === 'night' && room.nightStage) {
+            console.log(`[Night] request_night_stage от ${uid.slice(0,8)} → ${room.nightStage}`);
+            // Убедиться что сокет в комнате (мог потеряться при реконнекте)
+            socket.join(room.id);
+            socket.emit('night_stage', { stage: room.nightStage });
+        }
     });
 
     // ── Ночное действие ───────────────────────────────────
