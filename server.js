@@ -1371,6 +1371,61 @@ io.on('connection', async (socket) => {
             rejoinedPlayers.add(uid);
             console.log(`[Reconnect] ${uid.slice(0,8)} авто-реконнект через auth`);
         }
+
+        // ── FIX: при реконнекте отправить текущее состояние игры ──
+        if (rejoinedRoom) {
+            const room = rejoinedRoom;
+            const me = room.players.find(p => p.uid === uid);
+            const myRole = me ? me.role : null;
+            const phaseTimeLeft = room._phaseStart
+                ? Math.max(0, (room.phase === 'day' ? 30000 : room.phase === 'vote' ? 45000 : 30000) - (Date.now() - room._phaseStart))
+                : 0;
+
+            // Отправить полный game_rejoin для восстановления состояния
+            socket.emit('game_rejoin', {
+                roomId:         room.id,
+                myUid:          uid,
+                myRole:         myRole,
+                phase:          room.phase,
+                day:            room.day || 0,
+                night:          room.night || 0,
+                dead:           room.dead || [],
+                players:        room.players.map(p => ({
+                    uid:    p.uid,
+                    name:   p.name,
+                    avatar: p.avatar || '🎩',
+                    photoURL: p.photoURL || p.avatarImg || null,
+                    slot:   p.slot,
+                    isBot:  !!p.isBot,
+                    skinId: p.skinId || 'classic',
+                    role:   (p.uid === uid || (myRole === 'mafia' && p.role === 'mafia')) ? p.role : null
+                })),
+                phaseTimeLeft:  phaseTimeLeft,
+                myActionDone:   !!(room.actions && room.actions[{mafia:'kill',doctor:'save',detective:'investigate'}[myRole]] && room.actions[{mafia:'kill',doctor:'save',detective:'investigate'}[myRole]][uid]),
+                votedCount:     room.actions ? Object.keys(room.actions).length : 0,
+                aliveCount:     alivePlayers(room).length
+            });
+
+            // Если сейчас ночь — отправить текущую стадию чтобы клиент не застрял
+            if (room.phase === 'night' && room.nightStage) {
+                console.log(`[Reconnect] Отправляем текущую ночную стадию ${room.nightStage} для ${uid.slice(0,8)}`);
+                setTimeout(() => {
+                    socket.emit('night_stage', { stage: room.nightStage });
+                }, 500);
+            }
+            // Если сейчас день — отправить day_start
+            else if (room.phase === 'day') {
+                setTimeout(() => {
+                    socket.emit('day_start', { day: room.day, discussionSeconds: 30, serverTs: Date.now() });
+                }, 500);
+            }
+            // Если голосование — отправить vote_start
+            else if (room.phase === 'vote') {
+                setTimeout(() => {
+                    socket.emit('vote_start', { timeMs: Math.max(0, phaseTimeLeft), serverTs: Date.now() });
+                }, 500);
+            }
+        }
     });
 
     // ── Войти в очередь ───────────────────────────────────
