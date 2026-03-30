@@ -953,19 +953,45 @@ function startNight(room) {
     room._stageAdvancePending = false;
     room.night = (room.night || 0) + 1;
     room.actions = {};
-    room.stagedNight = true; // флаг: ночь управляется стадийной машиной
+    room.stagedNight = true;
+
+    // Выставляем NIGHT_START чтобы клиентский polling получал правильный ответ
+    room.nightStage = 'NIGHT_START';
 
     roomEmit(room, 'night_start', { serverTs: Date.now() });
     roomEmit(room, 'game_log', { msg: `🌙 Ночь ${room.night}. Город засыпает...`, cls: 'system' });
+    console.log(`[Night] Ночь ${room.night} началась | room: ${room.id}`);
 
-    nightRunStage(room, 'NIGHT_START');
+    // Переход к первой ролевой стадии через 3с.
+    // NIGHT_START больше не идёт через nightRunStage — клиент обрабатывает его через night_start event.
+    const firstStage = nightGetFirstStage(room);
+    const t = setTimeout(() => {
+        try {
+            if (room.phase === 'night' && room.nightStage === 'NIGHT_START') {
+                console.log(`[Night] Переход NIGHT_START → ${firstStage}`);
+                nightRunStage(room, firstStage);
+            } else {
+                console.warn(`[Night] Пропуск перехода NIGHT_START: phase=${room.phase} nightStage=${room.nightStage}`);
+            }
+        } catch(e) {
+            console.error('[Night] ОШИБКА перехода от NIGHT_START:', e);
+        }
+    }, 3000);
+    room.timers.push(t);
 }
 
 // ── Вспомогательные функции стадийной ночи ─────────────────
 
+// Первая ролевая стадия ночи (без NIGHT_START)
+function nightGetFirstStage(room) {
+    const alive = alivePlayers(room);
+    if (alive.some(p => p.role === 'doctor')) return 'DOCTOR_TURN';
+    return 'MAFIA_TURN';
+}
+
 function nightGetStages(room) {
     const alive = alivePlayers(room);
-    const stages = ['NIGHT_START'];
+    const stages = [];
     if (alive.some(p => p.role === 'doctor'))    stages.push('DOCTOR_TURN');
     stages.push('MAFIA_TURN');
     if (alive.some(p => p.role === 'detective')) stages.push('DETECTIVE_TURN');
@@ -983,7 +1009,7 @@ function nightNextStage(room) {
 function nightRunStage(room, stage) {
     if (room.phase !== 'night') return;
     // Защита от двойного вызова одной стадии
-    if (room.nightStage === stage && stage !== 'NIGHT_START') return;
+    if (room.nightStage === stage) return;
     room.nightStage = stage;
     room._stageAdvancePending = false;
 
