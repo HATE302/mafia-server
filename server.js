@@ -1834,6 +1834,7 @@ io.on('connection', async (socket) => {
 // ── Health check endpoint ──────────────────────────────────
 app.get('/', (req, res) => res.json({
     status: 'ok',
+    version: 'staged-night-v2',
     queue: queue.size,
     rooms: rooms.size
 }));
